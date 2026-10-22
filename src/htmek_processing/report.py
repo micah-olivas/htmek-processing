@@ -287,7 +287,10 @@ def _report_page(page, value, norm_col):
     top_a = 0.9  # table + image crops
     top_b, h_b = top_a + P["col_w"] + 0.6, 1.15  # progress curves
     top_c, h_c = top_b + h_b + 1.0, 2.5  # rate-vs-[BzP] panels (square) and key
-    top_d, h_d = top_c + h_c + 0.85, 0.75  # Km and Vmax / [E] strips
+    std = page.get("standards")  # this chamber's NADH standards and calibration line, if given
+    # with the standard curve as a third square, the key moves to a band under the row
+    h_key = 0.95 if std is not None else 0.0
+    top_d, h_d = top_c + h_c + 0.85 + h_key, 0.75  # Km and Vmax / [E] strips
     vm = page.get("vmax")  # the Vmax / [E] strip, when normalized fits were given
     legend_h = 0.4 if km is not None and vm is not None else 0.0  # their shared key
     H = (top_d + h_d + legend_h if km is not None else top_c + h_c) + 0.65  # page height
@@ -643,9 +646,83 @@ def _report_page(page, value, norm_col):
             loc="left",
             fontsize=11.5,
         )
-        # the key, just right of the normalized panel (which now sits in col 3)
-        key_l = col[2] + h_c + 0.45
-        key = box(key_l, top_c, P["w"] - key_l - 0.1, h_c)
+        # this chamber's NADH standard curve: its button median at every standard, with the
+        # calibration line that converts its signal to [NADH] (third square, from col 5)
+        if std is not None:
+            ax = box(col[4], top_c, h_c, h_c)
+            fig.key["standards"] = ax
+            pts, line = std["points"], std["line"]
+            if line is not None:
+                x_line = np.array([0.0, pts["conc_uM"].max() * 1.04])
+                ax.plot(x_line, line["slope"] * x_line + line["intercept"],
+                        color=FIT_COLORS["line"], lw=0.9, zorder=2)
+            ax.plot(pts["conc_uM"], pts[std["value"]], "o", ms=6, color=REPORT_COLORS["this"],
+                    mec="k", mew=0.5, zorder=3)
+            y = pts[std["value"]].to_numpy(float)
+            y_pad = 0.05 * (np.nanmax(y) - np.nanmin(y) or 1)
+            ax.set_xlim(0, pts["conc_uM"].max() * 1.06)
+            ax.set_ylim(np.nanmin(y) - y_pad, np.nanmax(y) + y_pad)
+
+            # inset, top left: the lowest standards (up to zoom_max), a true zoom: the
+            # panel's proportions and one magnification in x and y, so the line keeps its
+            # angle and its box on the panel has the inset's shape. If the low points don't
+            # fit at that magnification, the inset fits its own y range instead.
+            low = pts[pts["conc_uM"] <= std["zoom_max"]]
+            if len(low) >= 2:
+                zoom = ax.inset_axes([0.06, 0.56, 0.4, 0.4])
+                fig.key["standards_zoom"] = zoom
+                if line is not None:
+                    zoom.plot(x_line, line["slope"] * x_line + line["intercept"],
+                              color=FIT_COLORS["line"], lw=0.9, zorder=2)
+                zoom.plot(low["conc_uM"], low[std["value"]], "o", ms=5,
+                          color=REPORT_COLORS["this"], mec="k", mew=0.5, zorder=3)
+                X0, X1 = ax.get_xlim()
+                Y0, Y1 = ax.get_ylim()
+                # room around the points for their labels: the window reaches past the top
+                # standard, and the points sit between 18 % and 80 % of its height
+                z_x1 = low["conc_uM"].max() * 1.3
+                z_x0 = -0.12 * z_x1
+                y_low = low[std["value"]].to_numpy(float)
+                z_span = (Y1 - Y0) * (z_x1 - z_x0) / (X1 - X0)  # same magnification in y
+                z_y0 = np.nanmin(y_low) - 0.18 * z_span
+                if np.nanmax(y_low) > z_y0 + 0.8 * z_span:  # doesn't fit: its own y range
+                    z_pad = 0.3 * (np.ptp(y_low) or 1)
+                    z_y0, z_span = np.nanmin(y_low) - z_pad, np.ptp(y_low) + 2 * z_pad
+                zoom.set_xlim(z_x0, z_x1)
+                zoom.set_ylim(z_y0, z_y0 + z_span)
+                # each point labeled with its [NADH] (µM), on the side of the line that is
+                # free: upper left, except the first (at the left edge), to its right
+                for i, (conc, val) in enumerate(zip(low["conc_uM"], low[std["value"]])):
+                    first = i == 0
+                    zoom.annotate(f"{conc:g}", (conc, val), xytext=(5, -1) if first else (-4, 3),
+                                  textcoords="offset points", ha="left" if first else "right",
+                                  va="center" if first else "bottom", fontsize=7.5, zorder=6)
+                zoom.set_xticks([])  # the points carry their [NADH]
+                zoom.yaxis.set_major_locator(plt.MaxNLocator(2))
+                zoom.yaxis.tick_right()  # clear of the panel's own y labels
+                zoom.tick_params(labelsize=8, length=2, pad=1.5)
+                zoom.set_facecolor("white")
+                for sp in zoom.spines.values():
+                    sp.set_visible(True)
+                    sp.set_linewidth(0.6)
+                zoom.keep_frame = True  # exempt from the page-wide top/right spine removal
+            ax.set_xlabel("[NADH] (µM)")
+            ax.set_title("NADH standards (counts)", loc="left", fontsize=11.5)
+            if line is not None:
+                fig.key["standards_fit"] = ax.text(
+                    0.96, 0.05,
+                    f"slope {_fmt(line['slope'])} / µM\nr² {_fmt(line['r2'])}",
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=10,
+                    linespacing=1.2, zorder=6,
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5))
+
+        # the key: right of the normalized panel, or in a band under the row when the
+        # standard curve takes that place
+        if std is not None:
+            key = box(col[0], top_c + h_c + 0.75, P["w"] - col[0] - 0.1, h_key - 0.25)
+        else:
+            key_l = col[2] + h_c + 0.45
+            key = box(key_l, top_c, P["w"] - key_l - 0.1, h_c)
         fig.key["legend"] = key
         key.axis("off")
         handles = [
@@ -695,6 +772,8 @@ def _report_page(page, value, norm_col):
             frameon=False,
             borderaxespad=0,
             handlelength=1.6,
+            ncol=4 if std is not None else 1,  # a band under the row, or a column beside it
+            columnspacing=1.2,
         )
         if km is not None and vm is not None:
             # Km (cols 1-3) and Vmax / [E] (cols 4-6) side by side, one key below both
@@ -1386,6 +1465,10 @@ def chamber_report_pdf(
     image_qc=None,
     tile_px=None,
     key_chamber=None,
+    standards=None,
+    calibration=None,
+    standards_value="median",
+    standards_zoom_um=125,
 ):
     """One PDF page per chamber, for reviewing chambers one by one.
 
@@ -1424,6 +1507,13 @@ def chamber_report_pdf(
     (e.g. stitched.attrs["tile_px"]), marks every tile seam that runs through a crop with a
     pair of amber notches on the crop's edges: top and bottom for a vertical seam, left and
     right for a horizontal one. Seams sit at multiples of the pitch, as in tile_seam_flags.
+
+    `standards` (one row per chamber and standard: mark_row, mark_col, conc_uM and the
+    `standards_value` column, e.g. the button median) adds the chamber's NADH standard curve
+    as a third square on the bottom row, with its line from `calibration` (one row per
+    chamber: mark_row, mark_col, slope, intercept, r2; calibrate_chambers output) and the
+    line's slope and r², and an inset zoomed on the standards up to `standards_zoom_um`.
+    The key then moves to a band under that row.
 
     The last page is a key: one chamber's page, shrunk, with each element labeled
     (_report_key_page). `key_chamber` = (mark_row, mark_col) picks the example (default:
@@ -1477,6 +1567,9 @@ def chamber_report_pdf(
             return frozenset()
         ok = fits[fits["r2"] >= km_min_r2]
         return frozenset(zip(ok["mark_row"], ok["mark_col"]))
+
+    std_by = dict(list(standards.groupby(key))) if standards is not None else {}
+    cal_by = calibration.set_index(key) if calibration is not None else None
 
     good_raw = passing(mm_raw)
     good_norm = passing(mm)
@@ -1586,6 +1679,16 @@ def chamber_report_pdf(
                 rep_mm=others(of_tag(mm, tag), r, c),
                 good_raw=good_raw,
                 good_norm=good_norm,
+                standards=None
+                if standards is None or (r, c) not in std_by
+                else dict(
+                    points=std_by[(r, c)].sort_values("conc_uM"),
+                    value=standards_value,
+                    zoom_max=standards_zoom_um,
+                    line=cal_by.loc[(r, c)]
+                    if cal_by is not None and (r, c) in cal_by.index
+                    else None,
+                ),
                 info_floors=dict(info_floors or {}),
                 stamp=f"chamber report v{version} · built {built}",
                 experiment=experiment or "",

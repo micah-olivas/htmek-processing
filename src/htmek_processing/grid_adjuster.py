@@ -188,6 +188,9 @@ class GridAdjuster:
         from matplotlib.widgets import Slider, CheckButtons
 
         self.fig, self.ax = plt.subplots(figsize=figsize)
+        # ipympl shows its toolbar (zoom, pan, home) only on hover by default: keep it visible
+        if hasattr(self.fig.canvas, "toolbar_visible"):
+            self.fig.canvas.toolbar_visible = True
 
         # Display at most ~2048 px of image: redrawing a full stitched mosaic (~7k x 7k) on
         # every drag is what makes the widget lag. The full chip is shown strided; zooming
