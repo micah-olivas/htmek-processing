@@ -1,0 +1,43 @@
+[project]
+name = "htmek-processing"
+version = "0.1.0"
+description = "Process HT-MEK chip images: stitch tile scans, place the chamber grid, quantify chambers, fit rates and Michaelis-Menten curves, and build chamber reports."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Micah Olivas", email = "mbolivas@stanford.edu" }]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "matplotlib>=3.8",
+    "scipy>=1.11",
+    "xarray>=2024.1",       # tile scans and stitched stores are xarray/zarr
+    "zarr>=3.0",            # the acquisitions are zarr v3 stores
+    "dask>=2024.1",         # lazy stitched images
+    "scikit-image>=0.22",   # registration (tile_shift)
+    "tifffile>=2024.1",     # flatfield and standard images
+    "pillow>=10.0",         # crop thumbnails in the flaggers
+]
+
+[project.optional-dependencies]
+# the notebook widgets: GridAdjuster, the chamber flaggers
+interactive = [
+    "ipython>=8.0",
+    "ipywidgets>=8.1",
+]
+# automatic button-finding for the minichip (buttons.py)
+magnify = [
+    "magnify>=0.12",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/htmek_processing"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
