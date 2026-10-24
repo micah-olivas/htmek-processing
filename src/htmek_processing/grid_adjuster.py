@@ -31,7 +31,8 @@ class GridAdjuster:
     so a lazy zarr/xarray stack is never loaded whole. `to_kinetic_df()` uses the stack."""
 
     LABELS = ("TL", "TR", "BR", "BL")
-    MAX_DISPLAY_PX = 2048  # longest image edge drawn at once (see _render_view)
+    MAX_DISPLAY_PX = 1024  # longest image edge drawn at once (see _render_view)
+    DRAG_FPS = 30          # at most this many redraws per second while dragging a corner
 
     def __init__(
         self,
@@ -460,15 +461,60 @@ class GridAdjuster:
             return
         if e.inaxes is self.ax and e.xdata is not None:
             self._drag = self._nearest(e.xdata, e.ydata)
+            self._start_blit()
+
+    def _moving(self):
+        """The artists that follow a corner drag: the grid, its rings and labels, the handles."""
+        return [self._grid_pts, self._roi, self._bg_in, self._bg_out, *self._index_labels,
+                self._corner_pts, *self._labels]
+
+    def _start_blit(self):
+        """For a drag: draw everything once without the moving artists and keep that as the
+        background, so each move redraws only the grid (blitting). A full redraw on every
+        move is what makes dragging lag. Falls back to full redraws where blitting is
+        unsupported."""
+        import time
+
+        self._last_drag_draw = time.monotonic()
+        self._background = None
+        if not getattr(self.fig.canvas, "supports_blit", False):
+            return
+        for a in self._moving():
+            a.set_animated(True)
+        self.fig.canvas.draw()
+        self._background = self.fig.canvas.copy_from_bbox(self.ax.bbox)
+
+    def _end_blit(self):
+        if getattr(self, "_background", None) is not None:
+            for a in self._moving():
+                a.set_animated(False)
+            self._background = None
+        self.fig.canvas.draw_idle()
 
     def _on_motion(self, e):
         if self._drag is not None and e.inaxes is self.ax and e.xdata is not None:
+            import time
+
             self.corners[self._drag] = [e.xdata, e.ydata]
-            self._redraw()
+            now = time.monotonic()
+            if now - getattr(self, "_last_drag_draw", 0.0) < 1.0 / self.DRAG_FPS:
+                return  # throttled: the release (or the next move) draws the latest position
+            self._last_drag_draw = now
+            self._update_artists()
+            if getattr(self, "_background", None) is not None:
+                self.fig.canvas.restore_region(self._background)
+                for a in self._moving():
+                    self.ax.draw_artist(a)
+                self.fig.canvas.blit(self.ax.bbox)
+            else:
+                self.fig.canvas.draw_idle()
 
     def _on_release(self, e):
-        if self._drag is not None and self.corners_path is not None:
-            self.save_corners()  # auto-persist placement after each drag
+        if self._drag is not None:
+            self._update_artists()
+            self._end_blit()
+            if self.corners_path is not None:
+                self.save_corners()  # auto-persist placement after each drag
         self._drag = None
 
     @staticmethod
@@ -479,6 +525,11 @@ class GridAdjuster:
         coll.set_heights(d)
 
     def _redraw(self):
+        self._update_artists()
+        self.fig.canvas.draw_idle()
+
+    def _update_artists(self):
+        """Move the grid, its rings and labels, and the handles to the current corners."""
         cx, cy = self.centers()
         pts = np.column_stack([cx.ravel(), cy.ravel()])
         self._grid_pts.set_data(cx.ravel(), cy.ravel())
@@ -491,5 +542,3 @@ class GridAdjuster:
         self._corner_pts.set_data(self.corners[:, 0], self.corners[:, 1])
         for lab, (x, y) in zip(self._labels, self.corners):
             lab.set_position((x, y))
-
-        self.fig.canvas.draw_idle()
