@@ -14,7 +14,8 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 
-from .fit import BOUNDS_MM, fit_mm_table, four_pl, guess_mm, michaelis_menten, slope_4pl_in_window
+from .mm import BOUNDS_MM, fit_mm_table, guess_mm, michaelis_menten
+from .rates import four_pl, slope_4pl_in_window
 from .plots import CONTROL_COLORS, FIT_COLORS
 
 KEYS = ["mark_row", "mark_col"]

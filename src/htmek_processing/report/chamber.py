@@ -8,8 +8,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from ..plots import FIT_COLORS
-from ..fit import four_pl, michaelis_menten
+from ..analysis.plots import FIT_COLORS
+from ..analysis.rates import four_pl
+from ..analysis.mm import michaelis_menten
 
 
 # Version of the chamber report's layout and content. Bump it whenever the report changes

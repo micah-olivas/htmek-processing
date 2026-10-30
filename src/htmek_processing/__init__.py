@@ -1,9 +1,15 @@
 """HT-MEK chip image processing: from raw tile scans to per-chamber rates and fits.
 
-Modules follow the pipeline: layout (chamber identities), io (images, standards), stitch
-(tile scans, flatfield), grid and grid_adjuster (chamber positions), quantify (per-chamber
-intensities), plots (QC), fit (rates, calibration, Michaelis-Menten), report (chamber
-reports, volcano statistics, experiment report), flagging (excluding chambers) and buttons (magnify button-finding).
+Three subpackages follow the pipeline:
+    processing   images -> per-chamber numbers: layout (chamber identities), io (images,
+                 standards), stitch (tile scans, flatfields; fit_flatfield.py is the BaSiC
+                 script it runs), grid and grid_adjuster (chamber positions), buttons
+                 (magnify button-finding), quantify (per-chamber intensities)
+    analysis     per-chamber numbers -> rates, fits, QC: rates (lines, 4PL, rate rules), mm
+                 (Michaelis-Menten), standards (NADH standard lines), flagging (excluding
+                 chambers), plots and kinetics_qc (QC figures)
+    report       chamber (one page per chamber), volcano (per-variant statistics),
+                 experiment (the chip-level report)
 
 Every function is also available from the package itself, as it was from chip_utils:
 
@@ -12,14 +18,14 @@ Every function is also available from the package itself, as it was from chip_ut
 
 __version__ = "0.1.0"
 
-from .layout import (  # noqa: F401
+from .processing.layout import (  # noqa: F401
     _column_items,
     column_tags,
     pinlist_tags,
     mirror_pinlist,
     chamber_tags,
 )
-from .io import (  # noqa: F401
+from .processing.io import (  # noqa: F401
     load_image,
     to_2d_frame,
     time_coord,
@@ -30,7 +36,7 @@ from .io import (  # noqa: F401
     parse_concentration,
     load_standard_images,
 )
-from .stitch import (  # noqa: F401
+from .processing.stitch import (  # noqa: F401
     open_tiled,
     overlap_px,
     _gap_trims,
@@ -46,7 +52,7 @@ from .stitch import (  # noqa: F401
     flatfield_from_tiles,
     flatfield_correct,
 )
-from .grid import (  # noqa: F401
+from .processing.grid import (  # noqa: F401
     grid_centers,
     bilinear_grid,
     save_corners,
@@ -62,7 +68,7 @@ from .grid import (  # noqa: F401
     find_buttons,
     snap_to_spots,
 )
-from .quantify import (  # noqa: F401
+from .processing.quantify import (  # noqa: F401
     _circ_mask,
     _resolve_bg,
     intensities_at,
@@ -75,10 +81,10 @@ from .quantify import (  # noqa: F401
     fit_bleaching,
     chamber_timecourse,
 )
-from .grid_adjuster import (  # noqa: F401
+from .processing.grid_adjuster import (  # noqa: F401
     GridAdjuster,
 )
-from .plots import (  # noqa: F401
+from .analysis.plots import (  # noqa: F401
     _display_path,
     _image_name,
     show_grid,
@@ -96,7 +102,7 @@ from .plots import (  # noqa: F401
     plot_control_traces,
     plot_chip_map,
 )
-from .fit import (  # noqa: F401
+from .analysis.rates import (  # noqa: F401
     fit_lines,
     fit_rates,
     four_pl,
@@ -116,12 +122,16 @@ from .fit import (  # noqa: F401
     flag_poor_4pl,
     subtract_blank_rate,
     normalize_rates,
+)
+from .analysis.mm import (  # noqa: F401
     michaelis_menten,
     guess_mm,
     BOUNDS_MM,
     fit_mm,
     fit_mm_one_out,
     fit_mm_table,
+)
+from .analysis.standards import (  # noqa: F401
     calibrate_chambers,
     predict_conc,
 )
@@ -149,7 +159,7 @@ from .report import (  # noqa: F401
     _report_key_page,
     chamber_report_pdf,
 )
-from .flagging import (  # noqa: F401
+from .analysis.flagging import (  # noqa: F401
     save_flags,
     load_flags,
     apply_flags,
@@ -160,7 +170,7 @@ from .flagging import (  # noqa: F401
     KineticFlagger,
     ImageGridFlagger,
 )
-from .buttons import (  # noqa: F401
+from .processing.buttons import (  # noqa: F401
     column_pinlist,
     buttons_pipe_minichip,
 )
@@ -268,7 +278,7 @@ __all__ = [
     "column_pinlist",
     "buttons_pipe_minichip",
 ]
-from .kinetics_qc import (  # noqa: F401
+from .analysis.kinetics_qc import (  # noqa: F401
     SCAN_NAMES,
     scan_group,
     example_chambers,

@@ -13,7 +13,7 @@ import pytest
 import xarray as xr
 
 import htmek_processing as hp
-from htmek_processing import stitch
+from htmek_processing.processing import stitch
 
 
 # --- local corrections

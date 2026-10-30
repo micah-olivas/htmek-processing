@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .io import load_image, n_used_frames, time_coord
+from ..processing.io import load_image, n_used_frames, time_coord
 
 
 def _display_path(p):
@@ -861,7 +861,7 @@ def progress_fit_overlays(traces, rates, value, *, t="seconds", per=("mark_row",
     `per`): the 4PL (`curves`) with its tangent at the initial rate v0 (`tangents`) where model == "4pl",
     else the straight line (`lines`, through the points' mean), and `color` by model.
     Returns dict(curves=..., lines=..., tangents=..., color=...) to pass as **kwargs."""
-    from .fit import four_pl
+    from .rates import four_pl
 
     keys = list(per)
     means = traces.groupby(keys)[[t, value]].mean()
@@ -887,7 +887,7 @@ def show_progress_fits(traces, rates, chambers, value, *, t="seconds", labels=No
     (light peach) and its tangent at v0 (dark orange), or the straight line (gray) when the 4PL
     was not used, with the rate and the reason written in. `chambers` is a list of
     (mark_row, mark_col); `labels` optional titles for them. One axis per chamber."""
-    from .fit import four_pl
+    from .rates import four_pl
 
     fits = rates.set_index(["mark_row", "mark_col"])
     n = len(chambers)

@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .io import _STD_RE, load_standard_images, n_used_frames, time_coord
+from ..processing.io import _STD_RE, load_standard_images, n_used_frames, time_coord
 
 
 def save_flags(path, flagged, tags=None):
