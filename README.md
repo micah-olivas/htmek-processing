@@ -45,7 +45,8 @@ htmek-processing/
     │   ├── grid.py               # Chamber centers from 4 corners; warps; saved placements
     │   ├── grid_adjuster.py      # GridAdjuster: interactive grid placement
     │   ├── buttons.py            # magnify button-finding for the minichip
-    │   └── quantify.py           # Per-chamber ROI and annulus statistics; kinetic traces; bleaching
+    │   ├── quantify.py           # Per-chamber ROI and annulus statistics; kinetic traces; bleaching
+    │   └── chamberqc.py          # Button image QC: runs chamberqc (its own env) on the pipeline's grid
     ├── analysis/                 # Per-chamber numbers -> rates, fits, QC
     │   ├── rates.py              # Lines and 4PL fits, the rate rules, depletion / r² flags, BLANK subtraction
     │   ├── mm.py                 # Michaelis-Menten fits, per chamber or pooled

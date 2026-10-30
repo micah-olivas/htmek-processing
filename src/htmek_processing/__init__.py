@@ -4,7 +4,8 @@ Three subpackages follow the pipeline:
     processing   images -> per-chamber numbers: layout (chamber identities), io (images,
                  standards), stitch (tile scans, flatfields; fit_flatfield.py is the BaSiC
                  script it runs), grid and grid_adjuster (chamber positions), buttons
-                 (magnify button-finding), quantify (per-chamber intensities)
+                 (magnify button-finding), quantify (per-chamber intensities), chamberqc
+                 (button image QC, run in chamberqc's own environment)
     analysis     per-chamber numbers -> rates, fits, QC: rates (lines, 4PL, rate rules), mm
                  (Michaelis-Menten), standards (NADH standard lines), flagging (excluding
                  chambers), plots and kinetics_qc (QC figures)
@@ -101,6 +102,11 @@ from .analysis.plots import (  # noqa: F401
     CONTROL_COLORS,
     plot_control_traces,
     plot_chip_map,
+)
+from .processing.chamberqc import (  # noqa: F401
+    CHAMBERQC_REPO,
+    chamberqc_inputs,
+    run_chamberqc,
 )
 from .analysis.rates import (  # noqa: F401
     fit_lines,
