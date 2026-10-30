@@ -86,6 +86,59 @@ def load_corners(path):
     return np.asarray(load_mask(path)["corners"], float)
 
 
+WARP_REACH = 8  # chambers: how far a local correction's offset reaches (see warp_offsets)
+
+
+def warp_offsets(controls, n_rows, n_cols, reach=WARP_REACH):
+    """Local corrections to a 4-corner grid: (dx, dy), each (n_rows, n_cols), the offset at
+    every chamber, interpolated from `controls` [[row, col, dx, dy], ...] over the grid's
+    (row, col) with a Gaussian radial basis, so each correction fades to ~0 within about
+    `reach` chambers. The four corner chambers are pinned at 0 unless they are controls."""
+    from scipy.interpolate import RBFInterpolator
+
+    pts = {(int(r), int(c)): (dx, dy) for r, c, dx, dy in controls}
+    for rc in ((0, 0), (0, n_cols - 1), (n_rows - 1, 0), (n_rows - 1, n_cols - 1)):
+        pts.setdefault(rc, (0.0, 0.0))
+    rc = np.array(list(pts), float)
+    d = np.array(list(pts.values()), float)
+    rows, cols = np.mgrid[0:n_rows, 0:n_cols]
+    off = RBFInterpolator(rc, d, kernel="gaussian", epsilon=1.5 / reach, degree=-1)(
+        np.c_[rows.ravel(), cols.ravel()]
+    )
+    return off[:, 0].reshape(n_rows, n_cols), off[:, 1].reshape(n_rows, n_cols)
+
+
+def load_warp(path):
+    """The local corrections saved by GridAdjuster(warp_path=...): [[row, col, dx, dy], ...],
+    or [] when `path` is None or doesn't exist."""
+    import json
+
+    path = Path(path) if path else None
+    return json.loads(path.read_text())["controls"] if path and path.exists() else []
+
+
+def save_warp(path, controls):
+    """Save local corrections, {(row, col): (dx, dy)} or [[row, col, dx, dy], ...], to JSON."""
+    import json
+
+    items = (controls.items() if isinstance(controls, dict)
+             else [((r, c), (dx, dy)) for r, c, dx, dy in controls])
+    rows = [[int(r), int(c), float(dx), float(dy)] for (r, c), (dx, dy) in sorted(items)]
+    Path(path).write_text(json.dumps({"controls": rows, "reach": WARP_REACH}, indent=1))
+    return str(path)
+
+
+def warped_grid(corners_path, warp_path, n_rows, n_cols):
+    """Chamber centers (cx, cy) of a saved placement: the 4-corner bilinear grid from
+    `corners_path` plus the local corrections in `warp_path` (none if it doesn't exist)."""
+    cx, cy = bilinear_grid(load_mask(corners_path)["corners"], n_rows, n_cols)
+    controls = load_warp(warp_path)
+    if not controls:
+        return cx, cy
+    dx, dy = warp_offsets(controls, n_rows, n_cols)
+    return cx + dx, cy + dy
+
+
 def unit_cell_average(image, cx, cy, *, half_px=(80, 200)):
     """The typical unit cell of a chip image: the median, over every chamber, of the window
     centered on its grid position (cx, cy).

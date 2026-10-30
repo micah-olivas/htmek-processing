@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .quantify import bleach_correct, fit_bleaching
+
 
 def fit_lines(
     df,
@@ -41,12 +43,12 @@ def fit_lines(
                     slope_name: slope,
                     "intercept": intercept,
                     "r2": (1 - np.sum(resid**2) / ss_tot) if ss_tot > 0 else np.nan,
-                    "n": len(xv),
+                    "n_points": len(xv),
                 }
             )
         else:
             rec.update(
-                {slope_name: np.nan, "intercept": np.nan, "r2": np.nan, "n": len(xv)}
+                {slope_name: np.nan, "intercept": np.nan, "r2": np.nan, "n_points": len(xv)}
             )
         rows.append(rec)
 
@@ -247,7 +249,7 @@ def _fit_4pl_summary(job):
     ok = np.isfinite(tv) & np.isfinite(yv)
     tv, yv = tv[ok], yv[ok]
     n = len(tv)
-    rec = {"n": n}
+    rec = {"n_points": n}
     if n < min_points:
         return rec
 
@@ -294,6 +296,7 @@ def _fit_4pl_summary(job):
         rise_4pl=rise,
         rise_snr=rise_snr,
         plateaus=plateaus,
+        r2_4pl=r2(rss_4pl),  # the 4PL's fit over the whole run, whichever model gives the rate
     )
 
     # ---- the rules, in order: the first that fails keeps the line ---------------------
@@ -429,10 +432,158 @@ def fit_4pl_rates(
         "rise_4pl",
         "rise_snr",
         "plateaus",
+        "r2_4pl",
     ]
     cols += ["slope_line"] + (["rate_at_t"] if t_rate is not None else [])
-    cols += ["model", "reason", "vmax", "r2", "n"]
+    cols += ["model", "reason", "vmax", "r2", "n_points"]
     return pd.DataFrame([{**h, **f} for h, f in zip(heads, fits)]).reindex(columns=cols)
+
+
+# The standard 4PL rules for progress curves (MBO-040, 2026-10-05; see _fit_4pl_summary): the 4PL
+# can only rise; its rise across the run is >= 10 x the points' scatter about it; and, when the
+# signal is in the substrate's units (calibrated NADH vs [BzP], µM), it rises at most 1.2 x [S]
+# and, if it levels off inside the run, by at least 0.5 x [S]
+PROGRESS_4PL_RULES = dict(rising=True, min_rise_snr=10, max_rise_frac=1.2, plateau_min_frac=0.5)
+
+
+def flag_early_depletion(rates, traces, *, t="seconds", per=("mark_row", "mark_col"), min_rise_snr=10,
+                         max_half_rise=1.0):
+    """Flag runs whose curve is already slowing at the first frame: column `depleted_early`.
+
+    A run is flagged when the 4PL was not used (model "linear") although it beats the line
+    by BIC and rises above the noise (rise_snr >= `min_rise_snr`), and its steepest slope is
+    at or before the first frame: b <= 1 (steepest at t -> 0) or t_peak before the run's
+    first time point; and its 4PL midpoint c falls within the first `max_half_rise` of the
+    run (default 1.0: anywhere in it; a slow, slightly bent trace whose midpoint is beyond
+    the run is not flagged). On MBO-051 (2026-10-29), c within the run gave the most
+    consistent Km: within variants (median CV 0.27) and between the high- and low-pulldown
+    halves (median Km ratio 1.02), vs 0.29 / 1.04 with c in the first half. Its substrate is
+    largely used up within the first frames, so no frame
+    is on the initial slope: the line underestimates v0 and the 4PL's steepest slope is an
+    extrapolation (MBO-051, 2026-10-28). Leave these runs out of the MM fits.
+
+    `rates` is fit_progress_curves / fit_4pl_rates output with its `reason` column; `per`
+    keys a run in `traces` (e.g. ("bzp_uM", "mark_row", "mark_col"))."""
+    span = traces.groupby(list(per))[t].agg(_t0="min", _t1="max").reset_index()
+    out = rates.merge(span, on=list(per), how="left")
+    reason = out["reason"].fillna("")
+    early_peak = reason.str.contains("no steepest point") | (
+        reason.str.contains("outside the run") & (out["t_peak"] < out["_t0"]))
+    half_done = out["c"] <= out["_t0"] + max_half_rise * (out["_t1"] - out["_t0"])
+    out["depleted_early"] = ((out["model"] == "linear") & early_peak & half_done
+                             & (out["rise_snr"] >= min_rise_snr))
+    return out.drop(columns=["_t0", "_t1"])
+
+def force_4pl_on_depleted(rates, traces, *, t="seconds", per=("mark_row", "mark_col"), rate="v0"):
+    """For runs flagged `depleted_early` (flag_early_depletion), set `rate` to the 4PL's
+    steepest slope inside the run's time window (slope_4pl_in_window: the 4PL's own steepest
+    point when it lies in the data, else the slope at the first frame), and `model` to
+    "4pl_forced". The line kept for these runs underestimates v0; this never extrapolates
+    before the first frame (MBO-051, 2026-10-29). Other runs are unchanged."""
+    span = traces.groupby(list(per))[t].agg(_t0="min", _t1="max").reset_index()
+    out = rates.merge(span, on=list(per), how="left")
+    sel = out["depleted_early"].fillna(False).astype(bool).to_numpy()
+    if sel.any():
+        d = out.loc[sel]
+        out.loc[sel, rate] = slope_4pl_in_window(d["a"], d["d"], d["c"], d["b"], d["_t0"], d["_t1"])
+        out.loc[sel, "model"] = "4pl_forced"
+    return out.drop(columns=["_t0", "_t1"])
+
+
+def flag_poor_4pl(rates, *, min_r2_4pl=0.98, name="left_out_of_mm"):
+    """Mark runs whose 4PL fit over the whole run has r² below `min_r2_4pl` (column
+    `r2_4pl`, from fit_4pl_rates), in the boolean column `name`, to leave them out of the
+    MM fits. A progress curve the 4PL cannot follow (an imaging step mid-run, a flat trace
+    with no rise above the noise) gives no usable rate under either model. On MBO-051
+    (2026-10-29) every run outside 156.25 µM had r2_4pl >= 0.993 (1st percentile); at
+    156.25 µM, 0.98 caught 533 of the 576 runs in the rows with a mid-run dip."""
+    out = rates.copy()
+    out[name] = ~(out["r2_4pl"] >= min_r2_4pl)  # NaN (no 4PL) is left out too
+    return out
+
+def subtract_blank_rate(rates, *, run="bzp_uM", rate="v0", ref_tags=("BLANK",)):
+    """Subtract, from every chamber's `rate`, the median `rate` of the reference chambers
+    (`ref_tags`, default the BLANKs) in the same run (`run`, e.g. the [S] of each assay): the
+    background rate with no enzyme (product carry-over, photo-products). Adds
+    f"{rate}_unsubtracted" and f"blank_median_{rate}"; `rate` becomes the difference."""
+    out = rates.copy()
+    ref = out[out["tag"].isin(ref_tags)].groupby(run)[rate].median()
+    out[f"{rate}_unsubtracted"] = out[rate]
+    out[f"blank_median_{rate}"] = out[run].map(ref)
+    out[rate] = out[rate] - out[f"blank_median_{rate}"]
+    return out
+
+
+def fit_progress_curves(
+    traces,
+    value="median",
+    *,
+    t="seconds",
+    per=("mark_row", "mark_col"),
+    ref_tags=("BLANK",),
+    bleach="model",
+    max_ref_slope=0.001,
+    substrate=None,
+    end=None,
+    p0=guess_4pl,
+    bounds=BOUNDS_4PL,
+    n_jobs=None,
+    **rules,
+):
+    """The standard rate step for an assay's progress curves (chamber_timecourse output):
+
+      1. bleach correction, from the `ref_tags` (BLANK) chambers, per exposure (frame):
+         `bleach`="model" (default) divides every chamber by a fitted exponential loss to a
+         floor (fit_bleaching; reference chambers rising faster than `max_ref_slope` per
+         exposure, e.g. product leaking in, are left out of it); "ratio" by the reference
+         median itself, exposure by exposure (bleach_correct); None skips it;
+      2. a 4PL and a straight line per chamber (fit_4pl_rates), with PROGRESS_4PL_RULES:
+         the initial rate `v0` is the 4PL's steepest slope when every rule holds, else the
+         line's slope; `model` and `reason` record which and why.
+
+    `per` keys one fit (e.g. ("bzp_uM", "mark_row", "mark_col") for several runs; the bleach
+    curve is then computed per run, i.e. per `per` key other than the chamber's). The [S]
+    rules (max_rise_frac, plateau_min_frac) apply only with `substrate`, the column holding
+    each run's [S] in the signal's units: leave it None while the signal is in counts.
+    `rules` override PROGRESS_4PL_RULES (e.g. min_rise_snr=5).
+
+    Returns (traces, rates): the traces with `<value>_bc` (the fitted signal; = `value` when
+    `bleach` is None) and the bleach curve in .attrs['bleach_curve'] ({run: {frame: factor}};
+    with "model" also .attrs['bleach_fit'], {run: fit_bleaching's dict}),
+    and fit_4pl_rates' table, one row per `per` key, with its `vmax` / `vmax_4pl` named `v0` /
+    `v0_4pl`: an initial rate from the progress curve, not a Michaelis-Menten Vmax."""
+    chamber = {"mark_row", "mark_col"}
+    run_keys = [k for k in per if k not in chamber]
+    fitted = f"{value}_bc"
+
+    curves, bleach_fits = {}, {}
+    if bleach is None:
+        out = traces.assign(**{fitted: traces[value]})
+    else:
+        parts = []
+        groups = traces.groupby(run_keys, sort=False) if run_keys else [((), traces)]
+        for key, g in groups:
+            # one run key: its plain value (e.g. 5000), not a 1-tuple
+            run = (key[0] if isinstance(key, tuple) and len(key) == 1 else key) if run_keys else "all"
+            if bleach == "model":
+                fit = fit_bleaching(g, value, ref_tags=ref_tags, per=[k for k in per if k in chamber],
+                                    max_slope=max_ref_slope)
+                bleach_fits[run], curves[run] = fit, fit["curve"]
+                bc = g.assign(**{fitted: g[value] / g["frame"].map(fit["curve"])})
+            else:
+                bc = bleach_correct(g, value=value, ref_tags=ref_tags, mode=bleach,
+                                    per=[k for k in per if k in chamber])
+                curves[run] = bc.attrs["bleach_curve"]
+            parts.append(bc)
+        out = pd.concat(parts, ignore_index=True)
+    out.attrs = {"bleach_curve": curves, **({"bleach_fit": bleach_fits} if bleach_fits else {})}
+
+    kw = dict(PROGRESS_4PL_RULES, **rules)
+    if substrate is None:   # the [S] rules need the signal in [S]'s units
+        kw["max_rise_frac"] = kw["plateau_min_frac"] = None
+    rates = fit_4pl_rates(out, value=fitted, t=t, end=end, per=per, p0=p0, bounds=bounds,
+                          substrate=substrate, n_jobs=n_jobs, **kw)
+    return out, rates.rename(columns={"vmax": "v0", "vmax_4pl": "v0_4pl"})
 
 
 def normalize_rates(

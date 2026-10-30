@@ -357,7 +357,7 @@ def show_chamber_timeseries(
 # Plot style shared by every figure. 4PL fits and their vmax tangent share an orange/peach
 # palette; straight-line fits are gray, so the two models are told apart at a glance.
 # 4PL curve light, its vmax tangent dark, so the two read apart at a glance
-FIT_COLORS = {"4pl": "#F7C59F", "vmax": "#B54708", "line": "0.45"}
+FIT_COLORS = {"4pl": "#F7C59F", "vmax": "#B54708", "vmax_forced": "#A23B8C", "line": "0.45"}
 
 
 def set_plot_style(font="Arial"):
@@ -834,3 +834,151 @@ def save_sparkline_pages(
                 pages += 1
     partial.replace(path)
     return pages
+
+
+def show_seams(image, seams_y, seams_x, *, title="", half=300):
+    """QC for a stitch: every point where four tiles meet, at full resolution, each crop on
+    its own contrast, with the seams in red. The chip's lines should run straight across.
+    `seams_y` / `seams_x` are the stitched store's attrs. Returns the figure."""
+    fig, axes = plt.subplots(len(seams_y), len(seams_x), figsize=(3 * len(seams_x), 3 * len(seams_y)),
+                             squeeze=False)
+    for i, y0 in enumerate(seams_y):
+        for j, x0 in enumerate(seams_x):
+            crop = np.asarray(image[y0 - half:y0 + half, x0 - half:x0 + half], dtype=float)
+            ax = axes[i, j]
+            ax.imshow(crop, cmap="gray", vmin=np.percentile(crop, 1), vmax=np.percentile(crop, 99.5))
+            ax.axhline(half, color="r", lw=0.5, alpha=0.6)
+            ax.axvline(half, color="r", lw=0.5, alpha=0.6)
+            ax.set_title(f"tiles {i},{j} | {i + 1},{j + 1}", fontsize=8)
+            ax.axis("off")
+    fig.suptitle(title or "every tile corner (red: the seams)", y=1.0)
+    fig.tight_layout()
+    return fig
+
+
+def progress_fit_overlays(traces, rates, value, *, t="seconds", per=("mark_row", "mark_col"), n=40):
+    """What chip_sparklines draws for fit_progress_curves' rates, per chamber (the keys of
+    `per`): the 4PL (`curves`) with its tangent at the initial rate v0 (`tangents`) where model == "4pl",
+    else the straight line (`lines`, through the points' mean), and `color` by model.
+    Returns dict(curves=..., lines=..., tangents=..., color=...) to pass as **kwargs."""
+    from .fit import four_pl
+
+    keys = list(per)
+    means = traces.groupby(keys)[[t, value]].mean()
+    tt = np.linspace(traces[t].min(), traces[t].max(), n)
+    out = dict(curves={}, lines={}, tangents={}, color={})
+    for _, f in rates.iterrows():
+        key = tuple(int(f[k]) if k in ("mark_row", "mark_col") else f[k] for k in keys)
+        if f["model"] == "4pl":
+            p = (f["a"], f["d"], f["c"], f["b"])
+            out["curves"][key] = (tt, four_pl(tt, *p))
+            out["tangents"][key] = (tt, four_pl(f["t_peak"], *p) + f["v0"] * (tt - f["t_peak"]))
+            out["color"][key] = FIT_COLORS["4pl"]
+        elif np.isfinite(f["slope_line"]) and key in means.index:
+            tm, ym = means.loc[key]
+            out["lines"][key] = (tt, ym + f["slope_line"] * (tt - tm))
+            out["color"][key] = FIT_COLORS["line"]
+    return out
+
+
+def show_progress_fits(traces, rates, chambers, value, *, t="seconds", labels=None, unit="RFU",
+                       ncols=4, figsize=None):
+    """Example progress curves with the fit that gave each initial rate: the points, the 4PL
+    (light peach) and its tangent at v0 (dark orange), or the straight line (gray) when the 4PL
+    was not used, with the rate and the reason written in. `chambers` is a list of
+    (mark_row, mark_col); `labels` optional titles for them. One axis per chamber."""
+    from .fit import four_pl
+
+    fits = rates.set_index(["mark_row", "mark_col"])
+    n = len(chambers)
+    ncols = min(ncols, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize or (3.6 * ncols, 2.9 * nrows), squeeze=False)
+    for ax, (r, c), lab in zip(axes.flat, chambers, labels or [None] * n):
+        g = traces[(traces["mark_row"] == r) & (traces["mark_col"] == c)].sort_values(t)
+        f = fits.loc[(r, c)]
+        tt = np.linspace(g[t].min(), g[t].max(), 200)
+        if f["model"] == "4pl":
+            p = (f["a"], f["d"], f["c"], f["b"])
+            ax.plot(tt, four_pl(tt, *p), color=FIT_COLORS["4pl"], lw=2.2, zorder=1)
+            ax.plot(tt, four_pl(f["t_peak"], *p) + f["v0"] * (tt - f["t_peak"]),
+                    color=FIT_COLORS["vmax"], lw=0.8, zorder=1)
+            ax.set_ylim(*ax.get_ylim())
+        else:
+            ax.plot(tt, g[value].mean() + f["slope_line"] * (tt - g[t].mean()), color=FIT_COLORS["line"],
+                    lw=1, zorder=1)
+        ax.plot(g[t], g[value], "o", ms=3.5, color="0.6", mec="k", mew=0.3, zorder=3)
+        ax.set_title(lab or f"({r}, {c})", loc="left", fontsize=9)
+        note = f"v0 {f['v0']:.3g} {unit}/s, {f['model']}" + (f"\n{f['reason']}" if isinstance(f["reason"], str) else "")
+        ax.text(0.04, 0.95, note, transform=ax.transAxes, fontsize=7.5, va="top")
+        ax.set(xlabel=t)
+    for ax in axes.flat[n:]:
+        ax.set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+# the AFMtag controls on slide and QC figures (WT and dead as approved for MBO-040 onward); BLANK
+# is dark gray here, not the white of the print maps, so its traces show on a white background
+CONTROL_COLORS = {"WT": "#5B7FA8", "N41A": "#ABABAB", "BLANK": "#555555"}
+
+
+def plot_control_traces(traces, value, *, s="bzp_uM", t="seconds", controls=None, ncols=3, unit="RFU"):
+    """The standard progress-curve check before any rate fit: one panel per substrate
+    concentration `s`, one thin line per chamber of each control tag (default the keys of
+    CONTROL_COLORS present in `traces`), and each tag's median over its chambers as a
+    thicker line. `value` is the traces' signal column, plotted against `t` on a linear axis;
+    each panel keeps its own y range. Returns the figure."""
+    controls = controls or [c for c in CONTROL_COLORS if c in set(traces["tag"])]
+    runs = sorted(traces[s].unique())
+    nrows = int(np.ceil(len(runs) / ncols))
+    ncols = min(ncols, len(runs))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 2.9 * nrows), squeeze=False)
+    for ax, run in zip(axes.flat, runs):
+        d = traces[(traces[s] == run) & traces["tag"].isin(controls)]
+        for tag in controls:
+            g = d[d["tag"] == tag]
+            color = CONTROL_COLORS.get(tag, "0.4")
+            for _, ch in g.groupby(["mark_row", "mark_col"]):
+                ch = ch.sort_values(t)
+                ax.plot(ch[t], ch[value], color=color, lw=0.7, alpha=0.35, zorder=1)
+            med = g.groupby("frame").agg(t=(t, "median"), v=(value, "median"))
+            n = g[["mark_row", "mark_col"]].drop_duplicates().shape[0]
+            ax.plot(med["t"], med["v"], color=color, lw=2.0, zorder=2, label=f"{tag} ({n})")
+        ax.set_title(f"{run / 1000:g} mM" if run >= 1000 else f"{run:g} µM", loc="left", fontsize=10)
+        ax.set(xlabel="time (s)" if t == "seconds" else t)
+    for ax in axes.flat[len(runs):]:
+        ax.set_visible(False)
+    for row in axes:
+        row[0].set_ylabel(f"{value} ({unit})")
+    axes.flat[0].legend(frameon=False, fontsize=8, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def plot_chip_map(values, title, label, *, n_rows=56, n_cols=32, cmap="Greens", pct=(1, 99), figsize=(4.2, 7.0)):
+    """One value per chamber as a chip map, the standard layout: no frame, rows and columns
+    counted from 1, and a thin horizontal colorbar below the map, as wide as it. `values` is
+    a Series indexed by (mark_row, mark_col); the color range is its `pct` percentiles.
+    Returns the figure."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    grid = values.unstack("mark_col").reindex(index=range(n_rows), columns=range(n_cols)).to_numpy(float)
+    fig, ax = plt.subplots(figsize=figsize)
+    lo, hi = np.nanpercentile(grid, pct)
+    im = ax.imshow(grid, cmap=cmap, vmin=lo, vmax=hi, interpolation="nearest")
+    cols = np.unique(np.linspace(0, n_cols - 1, 5).round().astype(int))
+    rows = np.unique(np.linspace(0, n_rows - 1, 5).round().astype(int))
+    ax.set_xticks(cols, cols + 1)
+    ax.set_yticks(rows, rows + 1)
+    ax.set(xlabel="column", ylabel="row")
+    ax.tick_params(length=0)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.set_title(title, loc="left", fontsize=9)
+    cax = make_axes_locatable(ax).append_axes("bottom", size="2.5%", pad=0.55)
+    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label(label)
+    cb.outline.set_linewidth(0.8)
+    fig.tight_layout()
+    return fig

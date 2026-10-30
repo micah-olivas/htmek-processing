@@ -59,36 +59,41 @@ def intensities_at(
     roi = d2 <= radius**2
     n_px = int(roi.sum())
 
-    # chambers whose whole window lies on the image; the rest stay NaN
+    # the ROI is read wherever it lies on the image; the annulus, which reaches further,
+    # only where it does too (a chamber at the edge keeps its ROI and gets a NaN background)
     x = np.rint(cx).astype(int).ravel()
     y = np.rint(cy).astype(int).ravel()
-    ok = (x >= win) & (x < W - win) & (y >= win) & (y < H - win)
 
-    def gather(mask):
+    def fits(r):
+        r = int(np.ceil(r))
+        return (x >= r) & (x < W - r) & (y >= r) & (y < H - r)
+
+    ok_roi = fits(radius)
+    ok_bg = fits(bg_outer) if use_bg else ok_roi
+
+    def gather(mask, ok):
         """(n_ok, n_mask_px) pixel values: one fancy-index read for every chamber at
         once."""
         return img[y[ok, None] + yy[mask], x[ok, None] + xx[mask]].astype(float)
 
-    def scatter(vals):
+    def scatter(vals, ok):
         """Place per-chamber values (n_ok,) back into a cx-shaped array, NaN off-image."""
         full = np.full(x.shape, np.nan)
         full[ok] = vals
         return full.reshape(cx.shape)
 
     # ROI stats per chamber
-    px = gather(roi)
-    stats = {a: getattr(np, a)(px, axis=1) for a in aggs}
-    out = {a: scatter(v) for a, v in stats.items()}
-    out["n_px"] = scatter(np.full(ok.sum(), n_px, float))
+    px = gather(roi, ok_roi)
+    stats = {a: scatter(getattr(np, a)(px, axis=1), ok_roi) for a in aggs}
+    out = dict(stats)
+    out["n_px"] = scatter(np.full(ok_roi.sum(), n_px, float), ok_roi)
 
     if use_bg:
-        bg = getattr(np, bg_agg)(
-            gather((d2 > bg_inner**2) & (d2 <= bg_outer**2)), axis=1
-        )
-        out["bg"] = scatter(bg)
+        bg = scatter(getattr(np, bg_agg)(gather((d2 > bg_inner**2) & (d2 <= bg_outer**2), ok_bg), axis=1), ok_bg)
+        out["bg"] = bg
         for a, v in stats.items():
             # a sum covers n_px pixels, so it loses n_px x the per-pixel background
-            out[f"{a}_net"] = scatter(v - bg * (n_px if a == "sum" else 1))
+            out[f"{a}_net"] = v - bg * (n_px if a == "sum" else 1)
     return out
 
 
@@ -105,6 +110,7 @@ def centers_to_df(
     bg_inner=None,
     bg_outer=None,
     bg_agg="median",
+    prefix=None,
 ):
     """Tidy DataFrame from explicit centers, one row per chamber.
 
@@ -112,6 +118,12 @@ def centers_to_df(
     With `bg=True` (or explicit bg_inner/bg_outer) it also adds the local background 'bg'
     and background-subtracted '<agg>_net' columns. If `img` is None the intensity columns
     are NaN.
+
+    `prefix` names the mask the image was read with, per the naming convention: "button"
+    for a button mask, "chamber_ROI" for a chamber ROI. With it every intensity column
+    carries the prefix (`button_sum`, `button_median_net`, `button_n_px`) and the annulus
+    background is `<prefix>_annulus_<bg_agg>`; without it the names stay unprefixed
+    (`sum`, `bg`, `sum_net`), as notebooks before MBO-051 expect.
 
     `columns` is any identity layout chamber_tags() accepts: a column list/dict
     (minichip), a pinlist DataFrame or .csv path, or a 2-D tag array. The centers are
@@ -150,7 +162,19 @@ def centers_to_df(
         float(radius),
     )  # lists: pd.concat-safe
     df.attrs["bg_annulus"] = (bi, bo)
-    return df
+    return _with_prefix(df, prefix, aggs, bg_agg)
+
+
+def _with_prefix(df, prefix, aggs, bg_agg="median"):
+    """Rename centers_to_df's intensity columns to the `<prefix>_...` convention (None: as is)."""
+    if not prefix:
+        return df
+    names = {a: f"{prefix}_{a}" for a in aggs}
+    names.update({f"{a}_net": f"{prefix}_{a}_net" for a in aggs})
+    names.update({"n_px": f"{prefix}_n_px", "bg": f"{prefix}_annulus_{bg_agg}"})
+    out = df.rename(columns={k: v for k, v in names.items() if k in df.columns})
+    out.attrs = df.attrs
+    return out
 
 
 def manual_grid(
@@ -238,12 +262,14 @@ def kinetic_traces(
     seconds=None,
     time_name="seconds",
     drop_empty=True,
+    prefix=None,
 ):
     """Apply one fixed grid (centers `cx`, `cy`) to every frame of a (time, y, x) stack.
 
     Returns a *long* tidy DataFrame, one row per (chamber, frame): frame, seconds,
     mark_row, mark_col, tag, x, y, then each `aggs` column (+ n_px, and bg / '<agg>_net'
     if a background annulus is on). Ready for seaborn per variant, or fit_rates(df).
+    `prefix` names the columns by mask, as centers_to_df's.
 
     `seconds` is either
       - per frame, shape (time,): every chamber in a frame shares one time, or
@@ -288,6 +314,7 @@ def kinetic_traces(
             bg_inner=bg_inner,
             bg_outer=bg_outer,
             bg_agg=bg_agg,
+            prefix=prefix,
         )
         d.insert(0, "frame", t)
         # per-frame time broadcasts to every chamber; per-chamber time ravels row-major,
@@ -350,3 +377,82 @@ def bleach_correct(
         raise ValueError(f"mode must be 'ratio' or 'difference', got {mode!r}")
     out.attrs["bleach_curve"] = curve.to_dict()
     return out
+
+
+def bleach_model(n, amplitude, rate, floor):
+    """Fraction of the first exposure's signal left after exposure `n` (0 = the first): an
+    exponential loss to a floor, amplitude * exp(-rate n) + floor, with amplitude + floor = 1."""
+    return amplitude * np.exp(-rate * np.asarray(n, float)) + floor
+
+
+def fit_bleaching(traces, value="median", *, ref_tags=("BLANK",), by="frame",
+                  per=("mark_row", "mark_col"), max_slope=None):
+    """Model photobleaching from reference chambers (no enzyme: BLANK by default), within one
+    run: each reference chamber's signal relative to its first exposure, the median over
+    them at each exposure (`by`), and an exponential loss to a floor fitted to that median
+    (bleach_model, per exposure: bleaching follows the light received, not the clock).
+
+    `max_slope` (fraction of the first exposure per exposure) leaves out reference chambers
+    that rise faster than that over the run (e.g. 0.001: product leaking in from a
+    neighbor), so they don't pull the curve. Returns dict(amplitude, rate, floor, curve =
+    {step: the model's factor}, median = {step: the reference median}, n_ref, n_left_out).
+    Pass `curve` on, or use fit_progress_curves(bleach="model")."""
+    from scipy.optimize import curve_fit
+
+    keys = list(per)
+    ref = traces[traces["tag"].isin(ref_tags)].sort_values(by)
+    if ref.empty:
+        raise ValueError(f"no reference chambers tagged {ref_tags} in the traces")
+    rel = ref[value] / ref.groupby(keys)[value].transform("first")
+    ref = ref.assign(_rel=rel)
+    n_left_out = 0
+    if max_slope is not None:
+        slope = ref.groupby(keys).apply(lambda g: np.polyfit(g[by], g["_rel"], 1)[0], include_groups=False)
+        rising = slope[slope > max_slope].index
+        n_left_out = len(rising)
+        ref = ref[~ref.set_index(keys).index.isin(rising)]
+    med = ref.groupby(by)["_rel"].median()
+    steps = med.index.to_numpy(float)
+    n = steps - steps.min()
+
+    def model(nn, amplitude, rate):
+        return bleach_model(nn, amplitude, rate, 1 - amplitude)   # 1 at the first exposure
+
+    try:
+        (amp, rate), _ = curve_fit(model, n, med.to_numpy(float), p0=[0.01, 0.2],
+                                   bounds=([-0.5, 0.0], [0.5, 10.0]), maxfev=20_000)
+    except (RuntimeError, ValueError):
+        amp, rate = 0.0, 0.0   # no bleaching resolved
+    curve = model(n, amp, rate)
+    return dict(amplitude=float(amp), rate=float(rate), floor=float(1 - amp),
+                curve=dict(zip(med.index.tolist(), curve.tolist())), median=med.to_dict(),
+                n_ref=int(ref[keys].drop_duplicates().shape[0]), n_left_out=n_left_out)
+
+
+def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=None,
+                       aggs=("median", "mean", "sum"), prefix=None):
+    """Per-timepoint intensities of every chamber of a kinetic run, the standard readout:
+    one row per chamber x frame with `seconds` (the time of the tile the chamber's center
+    falls in, since the run started: chambers in one pass are imaged up to a pass apart),
+    the ROI's `aggs` (raw, nothing subtracted) and n_px, and each agg minus the chamber's own
+    value at frame 0 (`<agg>_minus_frame0`).
+
+    `ring` = (inner, outer) adds a reference ring's median (`bg`, and `<agg>_net`); for an
+    assay put it outside the chamber: a ring on the chamber itself rises with the product
+    and would cancel the signal. `tiled` is the raw acquisition (its per-tile 'seconds'),
+    `tile_px` the stitched tile pitch (the store's attrs['tile_px']). `prefix` names the
+    columns by mask, as centers_to_df's (e.g. "chamber_ROI": `chamber_ROI_median`,
+    `chamber_ROI_median_minus_frame0`)."""
+    from .stitch import chamber_seconds
+
+    seconds = chamber_seconds(tiled["seconds"].values, cx, cy, tile_px)
+    inner, outer = ring if ring is not None else (None, None)
+    df = kinetic_traces(stack, cx, cy, columns, radius=radius, aggs=aggs, bg=ring is not None,
+                        bg_inner=inner, bg_outer=outer, seconds=seconds, drop_empty=False, prefix=prefix)
+    keys = ["mark_row", "mark_col"]
+    first = df[df["frame"] == df["frame"].min()].set_index(keys)
+    idx = df.set_index(keys).index
+    for a in aggs:
+        col = f"{prefix}_{a}" if prefix else a
+        df[f"{col}_minus_frame0"] = df[col].to_numpy() - idx.map(first[col]).to_numpy()
+    return df

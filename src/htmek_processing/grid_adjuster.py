@@ -1,7 +1,9 @@
-"""GridAdjuster: drag the grid's four corners onto the image (interactive)."""
+"""GridAdjuster: drag the grid's four corners onto the image, then any chamber to correct
+the grid locally (interactive)."""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -9,30 +11,60 @@ import matplotlib.pyplot as plt
 
 from .layout import chamber_tags
 from .io import time_coord
-from .grid import bilinear_grid, load_mask, save_corners
+from .grid import WARP_REACH, bilinear_grid, load_mask, load_warp, save_corners, save_warp, warp_offsets
 from .quantify import centers_to_df, kinetic_traces
+
+CTRL_COLOR = "#FF4FD8"  # local corrections (magenta: apart from the cyan corners and yellow ROIs)
+
+# the on-screen key: mouse actions (button, marker, color, size, what) and hotkeys (keys, what)
+KEY_MOUSE = [
+    ("left", "o", "cyan", 12, "drag a corner: place the grid"),
+    ("left", "D", CTRL_COLOR, 7, "drag any circle: fix it locally (the grid around it follows)"),
+    ("right", "D", CTRL_COLOR, 7, "right-click a fix: remove it"),
+]
+KEY_KEYS = [
+    ("z", "zoom box (one zoom, then back to dragging)"),
+    ("+ −", "zoom in / out where the mouse is"),
+    ("2 fingers", "pan (trackpad scroll)"),
+    ("h 0", "home: the whole chip"),
+    ("p", "pan (press again to stop)"),
+    ("esc", "leave zoom / pan"),
+    ("1–4", "jump to the TL / TR / BR / BL corner"),
+]
 
 
 class GridAdjuster:
-    """Drag 4 corner handles to place the grid; interior buttons are interpolated
-    (bilinear -> handles rotation, shear, slight keystone).
+    """Drag 4 corner handles to place the grid; interior chambers are interpolated
+    (bilinear -> handles rotation, shear, slight keystone). Then drag any chamber that is
+    still off onto its spot: it becomes a local correction, and the grid around it follows,
+    fading out within ~WARP_REACH chambers (grid.warp_offsets); the corners stay put.
 
-    Requires the ipympl backend: run `%matplotlib widget` in the notebook first.
+    Needs an interactive backend (`%matplotlib qt`, or ipympl's `%matplotlib widget`).
 
-        ga = GridAdjuster(img, columns={1: "WT", 2: "S92A", ...})  # drag the cyan handles
+        ga = GridAdjuster(img, columns={1: "WT", 2: "S92A", ...},
+                          corners_path="2_masks/corners.json", warp_path="2_masks/warp.json")
         df = ga.to_df()  # tidy DataFrame when happy
 
     Corner order is [top-left, top-right, bottom-right, bottom-left] = the corner-button
     centers. Pass `corners=` to seed a first placement (e.g. another acquisition's corners);
-    once `corners_path` exists, the saved placement is used instead.
+    once `corners_path` exists, the saved placement is used instead. The placement is saved
+    when the window opens and after every change. Local corrections go to `warp_path` (and
+    are resumed from it); without one they last only for the session. In later cells,
+    grid.warped_grid(corners_path, warp_path, n_rows, n_cols) gives the same centers.
 
     `img` may be a (time, y, x) stack, e.g. a kinetic run: one frame is shown (`frame`,
-    default 0) and a "frame" slider switches between them. Frames are read only when shown,
-    so a lazy zarr/xarray stack is never loaded whole. `to_kinetic_df()` uses the stack."""
+    default 0; negative counts from the end) and a "frame" slider switches between them.
+    Frames are read only when shown, so a lazy zarr/xarray stack is never loaded whole.
+    `to_kinetic_df()` uses the stack.
+
+    A "How to use" panel left of the image lists the mouse actions and the hotkeys
+    (KEY_KEYS): z zoom box, + / − zoom where the mouse is, two-finger scroll pans, h or 0 home, p pan, esc leave
+    zoom / pan, 1-4 the corners. It refits when the window is resized."""
 
     LABELS = ("TL", "TR", "BR", "BL")
     MAX_DISPLAY_PX = 1024  # longest image edge drawn at once (see _render_view)
-    DRAG_FPS = 30          # at most this many redraws per second while dragging a corner
+    DRAG_FPS = 30          # at most this many redraws per second while dragging
+    PANEL_RIGHT = 0.27     # figure fraction: the key panel ends here; image and sliders start right of it
 
     def __init__(
         self,
@@ -46,15 +78,22 @@ class GridAdjuster:
         bg_outer=None,
         vmin_pct=0,
         vmax_pct=99,
-        figsize=(9, 9),
+        figsize=(12.5, 8.5),
         pick_radius=None,
         frame=0,
+        warp_path=None,
     ):
         # A (time, y, x) stack stays lazy: only the frame on screen is read
         a = img.squeeze() if hasattr(img, "isel") else np.asarray(img).squeeze()
         self.stack = a if a.ndim == 3 else None
         self._seconds = time_coord(img) if self.stack is not None else None
         self._frame = int(frame or 0)
+        if self.stack is not None and self._frame < 0:  # e.g. -1: the last frame
+            self._frame += self.stack.shape[0]
+
+        # local corrections {(row, col): (dx, dy)}, resumed from warp_path
+        self.warp_path = Path(warp_path) if warp_path else None
+        self.controls = {(int(r), int(c)): (dx, dy) for r, c, dx, dy in load_warp(self.warp_path)}
         self.img = (
             self._read_frame(self._frame) if self.stack is not None else np.asarray(a)
         )
@@ -103,13 +142,25 @@ class GridAdjuster:
         self.corners = np.asarray(corners, float)
         self._drag = None
         self._build(vmin_pct, vmax_pct, figsize)
+        # saved as soon as the window opens (and after every change), so a later cell always
+        # finds the placement, even when only local corrections were made
+        self._persist()
 
     def _read_frame(self, t):
         """One 2-D frame of the stack as a numpy array (reads just that frame)."""
         return np.asarray(self.stack[int(t)])
 
     def centers(self):
-        return bilinear_grid(self.corners, self.n_rows, self.n_cols)
+        """Chamber centers (cx, cy): the corners' bilinear grid plus the local corrections."""
+        cx, cy = bilinear_grid(self.corners, self.n_rows, self.n_cols)
+        if not self.controls:
+            return cx, cy
+        dx, dy = warp_offsets([[*rc, *d] for rc, d in self.controls.items()], self.n_rows, self.n_cols)
+        return cx + dx, cy + dy
+
+    def save_warp(self, path=None):
+        """Save the local corrections to JSON (grid.load_warp and warped_grid read them)."""
+        return save_warp(path or self.warp_path, self.controls)
 
     def to_df(
         self,
@@ -296,11 +347,8 @@ class GridAdjuster:
             self.ax.annotate(lab, (x, y), color="cyan", fontsize=9)
             for lab, (x, y) in zip(self.LABELS, self.corners)
         ]
-        self.ax.set_title(
-            "drag corners; keys 1-4 zoom to TL/TR/BR/BL, 0 = whole chip\n"
-            "sliders: display gain (vmin/vmax), ROI radius (yellow), bg annulus (orange)",
-            fontsize=9,
-        )
+        # local corrections: magenta diamonds, moving with the grid
+        (self._ctrl_pts,) = self.ax.plot([], [], "D", ms=8, mfc="none", mec=CTRL_COLOR, mew=1.8, zorder=7)
 
         # live sliders: (frame,) display vmin/vmax (gain/cutoffs), radius (also the annulus inner edge), bg outer
         self.fig.subplots_adjust(bottom=0.34 if self.stack is not None else 0.30)
@@ -346,11 +394,26 @@ class GridAdjuster:
         self._mask_check = CheckButtons(ax_chk, ["show masks"], [True])
         self._mask_check.on_clicked(self._on_toggle_masks)
 
-        # mouse events drive corner dragging
+        # mouse events drive corner and chamber dragging
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
+        self.fig.canvas.mpl_connect("button_release_event", self._after_zoom)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self._connect_scroll_pan()
+
+        # the "How to use" panel left of the image (refit on resize), the sliders right of it
+        self.fig.subplots_adjust(left=self.PANEL_RIGHT + 0.06)
+        x0 = self.PANEL_RIGHT + 0.14  # room for the slider labels ("bg outer") left of the bars
+        for s in (getattr(self, "_frame_slider", None), self._vmin_slider, self._vmax_slider,
+                  self._radius_slider, self._bg_outer_slider):
+            if s is not None:
+                b = s.ax.get_position()
+                s.ax.set_position([x0, b.y0, 0.9 - x0, b.height])
+        self._key_ax = None
+        self._draw_key()
+        self.fig.canvas.mpl_connect("resize_event", lambda e: self._draw_key())
+        self._update_artists()
 
     def _render_view(self, ax=None):
         """Show the visible region at the finest stride that keeps it <= MAX_DISPLAY_PX,
@@ -382,9 +445,23 @@ class GridAdjuster:
         self.fig.canvas.draw_idle()
 
     def _on_key(self, e):
-        """Keys 1-4 zoom onto the TL/TR/BR/BL corner handle; 0 shows the whole chip."""
+        """z: one zoom box; + / −: zoom on the view's center; h or 0: the whole chip;
+        esc: leave zoom / pan (p is matplotlib's pan); 1-4: zoom onto a corner handle."""
         H, W = self.img.shape
-        if e.key == "0":
+        toolbar = getattr(self.fig.canvas, "toolbar", None)
+        mode = str(getattr(toolbar, "mode", "")) if toolbar is not None else ""
+        if e.key == "z" and toolbar is not None:
+            if "zoom" not in mode:
+                toolbar.zoom()
+            return
+        if e.key == "escape" and toolbar is not None and mode:
+            (toolbar.zoom if "zoom" in mode else toolbar.pan)()
+            return
+        if e.key in ("+", "=", "-", "_"):
+            at = (e.xdata, e.ydata) if e.inaxes is self.ax and e.xdata is not None else None
+            self._zoom_center(0.5 if e.key in ("+", "=") else 2.0, at=at)
+            return
+        if e.key in ("0", "h"):
             self.ax.set_xlim(-0.5, W - 0.5)
             self.ax.set_ylim(H - 0.5, -0.5)
         elif e.key in ("1", "2", "3", "4"):
@@ -400,6 +477,165 @@ class GridAdjuster:
         else:
             return
         self.fig.canvas.draw_idle()
+
+    def _zoom_center(self, factor, at=None):
+        """Zoom by `factor` (0.5: in 2x, 2: out 2x) about `at` (x, y), the point that stays put
+        under the mouse, or the view's center; never past the whole chip."""
+        H, W = self.img.shape
+        (x0, x1), (y1, y0) = self.ax.get_xlim(), self.ax.get_ylim()  # y is inverted
+        ax_, ay_ = at if at is not None else ((x0 + x1) / 2, (y0 + y1) / 2)
+        hw = min((x1 - x0) * factor / 2, W / 2)
+        hh = min((y1 - y0) * factor / 2, H / 2)
+        # the new view keeps `at` at the same fraction across it
+        fx = (ax_ - x0) / (x1 - x0) if x1 > x0 else 0.5
+        fy = (ay_ - y0) / (y1 - y0) if y1 > y0 else 0.5
+        xc = ax_ + (0.5 - fx) * 2 * hw
+        yc = ay_ + (0.5 - fy) * 2 * hh
+        self._set_view(xc, yc, hw, hh)
+
+    def _set_view(self, xc, yc, hw, hh):
+        """Show the window centered at (xc, yc), half-sizes (hw, hh), kept on the chip."""
+        H, W = self.img.shape
+        xc = min(max(xc, hw - 0.5), W - 0.5 - hw)
+        yc = min(max(yc, hh - 0.5), H - 0.5 - hh)
+        self.ax.set_xlim(xc - hw, xc + hw)
+        self.ax.set_ylim(yc + hh, yc - hh)
+        self.fig.canvas.draw_idle()
+
+    def _pan_px(self, dx_px, dy_px):
+        """Pan the view by a scroll of (dx_px, dy_px) screen pixels: the image follows the fingers."""
+        (x0, x1), (y1, y0) = self.ax.get_xlim(), self.ax.get_ylim()
+        bbox = self.ax.get_window_extent()
+        ppx = (x1 - x0) / max(bbox.width, 1)   # data units per screen pixel
+        ppy = (y1 - y0) / max(bbox.height, 1)
+        self._set_view((x0 + x1) / 2 - dx_px * ppx, (y0 + y1) / 2 - dy_px * ppy, (x1 - x0) / 2, (y1 - y0) / 2)
+
+    def _connect_scroll_pan(self):
+        """Two-finger (trackpad) scrolling pans the view. In a Qt window the raw scroll is read
+        from the widget (matplotlib's scroll_event keeps only its vertical steps); elsewhere
+        (ipympl) scroll pans up / down and shift-scroll left / right."""
+        canvas = self.fig.canvas
+        try:
+            from matplotlib.backends.qt_compat import QtCore
+        except ImportError:
+            QtCore = None
+        if QtCore is not None and hasattr(canvas, "installEventFilter"):
+            adjuster = self
+
+            class _ScrollPan(QtCore.QObject):
+                def eventFilter(self, obj, event):
+                    if event.type() != QtCore.QEvent.Type.Wheel:
+                        return False
+                    d = event.pixelDelta()
+                    if d.isNull():   # a mouse wheel, not a trackpad: one notch ~ 40 px
+                        a = event.angleDelta()
+                        dx, dy = a.x() / 3, a.y() / 3
+                    else:
+                        dx, dy = d.x(), d.y()
+                    adjuster._pan_px(dx, -dy)   # screen y grows down; the image's rows too
+                    return True
+
+            self._scroll_filter = _ScrollPan()
+            canvas.installEventFilter(self._scroll_filter)
+            return
+
+        def on_scroll(e):
+            if e.inaxes is not self.ax:
+                return
+            step = 60 * (e.step or 0)
+            if e.key == "shift":
+                self._pan_px(step, 0)
+            else:
+                self._pan_px(0, -step)
+
+        canvas.mpl_connect("scroll_event", on_scroll)
+
+    def _after_zoom(self, e):
+        """One zoom per `z`: once the box is drawn, back to dragging."""
+        toolbar = getattr(self.fig.canvas, "toolbar", None)
+        if toolbar is None or "zoom" not in str(getattr(toolbar, "mode", "")) or e.inaxes is not self.ax:
+            return
+        timer = self.fig.canvas.new_timer(interval=60)  # after the toolbar finishes its zoom
+        timer.single_shot = True
+        timer.add_callback(lambda: "zoom" in str(toolbar.mode) and toolbar.zoom())
+        timer.start()
+        self._zoom_timer = timer  # keep a reference until it fires
+
+    def _draw_key(self):
+        """The "How to use" panel, laid out in inches from its top: each row is as tall as its
+        wrapped text, the text wraps to the panel's width, and the whole panel scales down to
+        fit the window's height. Redrawn on resize."""
+        import textwrap
+        from matplotlib.patches import FancyBboxPatch
+
+        if self._key_ax is not None:
+            self._key_ax.remove()
+        W_in, H_in = self.fig.get_size_inches()
+        left, top = 0.15, 0.75  # inches from the figure's top-left
+        width = (self.PANEL_RIGHT - 0.012) * W_in - left
+        pad, line = 0.18, 0.19  # line height (in)
+        icon_x, text_x = 0.2, 1.05  # inches from the panel's left edge
+        wrap = int(np.clip((width - text_x - 0.2) / 0.075, 16, 30))  # characters that fit
+
+        rows = [("mouse", m) for m in KEY_MOUSE] + [("rule", None)] + [("keys", k) for k in KEY_KEYS]
+        heights = [
+            0.18 if kind == "rule"
+            else max(0.42 if kind == "mouse" else 0.32, len(textwrap.wrap(item[-1], wrap)) * line + 0.12)
+            for kind, item in rows
+        ]
+        note = textwrap.fill(f"A fix fades out within ~{WARP_REACH} chambers; the corners stay "
+                             "put. Every change saves.", wrap + 8)
+        height = pad + 0.35 + sum(heights) + 0.1 + note.count("\n") * 0.16 + 0.3 + pad
+        scale = min(1.0, (H_in - top - 0.2) / height)  # laid out at full size, then scaled to fit
+        fs = lambda size: size * scale
+
+        ax = self.fig.add_axes([left / W_in, 1 - (top + height * scale) / H_in,
+                                width / W_in, height * scale / H_in])
+        width = width / scale
+        ax.set_xlim(0, width)
+        ax.set_ylim(height, 0)  # unscaled inches from the panel's top
+        ax.axis("off")
+        ax.add_patch(FancyBboxPatch((0.02, 0.02), width - 0.04, height - 0.04,
+                                    boxstyle="round,pad=0,rounding_size=0.12", fc="#F5F7FA", ec="0.75", lw=0.8))
+        ax.text(icon_x, pad + 0.12, "How to use", fontsize=fs(12), weight="bold", va="center")
+
+        def mouse(y, which):
+            """A small mouse, its left or right button shaded."""
+            w, h = 0.26, 0.34
+            ax.add_patch(FancyBboxPatch((icon_x, y - h / 2), w, h, boxstyle="round,pad=0,rounding_size=0.09",
+                                        fc="white", ec="0.3", lw=0.9))
+            bx = icon_x if which == "left" else icon_x + w / 2
+            ax.add_patch(FancyBboxPatch((bx + 0.025, y - h / 2 + 0.025), w / 2 - 0.05, h / 2 - 0.05,
+                                        boxstyle="round,pad=0,rounding_size=0.03", fc="#4A90D9", ec="none"))
+            ax.plot([icon_x + w / 2] * 2, [y - h / 2, y], color="0.3", lw=0.8)
+            ax.plot([icon_x, icon_x + w], [y, y], color="0.3", lw=0.8)
+
+        def keycap(x, y, k):
+            w = 0.16 + 0.07 * len(k)
+            ax.add_patch(FancyBboxPatch((x, y - 0.12), w, 0.24, boxstyle="round,pad=0,rounding_size=0.04",
+                                        fc="white", ec="0.35", lw=0.9))
+            ax.text(x + w / 2, y, k, fontsize=fs(9), weight="bold", ha="center", va="center", family="monospace")
+            return x + w + 0.06
+
+        y = pad + 0.35
+        for (kind, item), h in zip(rows, heights):
+            yc = y + h / 2
+            if kind == "rule":
+                ax.plot([icon_x, width - icon_x], [yc, yc], color="0.8", lw=0.8)
+            else:
+                if kind == "mouse":
+                    which, marker, color, ms, text = item
+                    mouse(yc, which)
+                    ax.plot([icon_x + 0.5], [yc], marker, ms=ms * scale, mfc="none", mec=color, mew=1.8)
+                else:
+                    keys, text = item
+                    x = icon_x
+                    for k in keys.split():
+                        x = keycap(x, yc, k)
+                ax.text(text_x, yc, textwrap.fill(text, wrap), fontsize=fs(9.5), va="center", linespacing=1.25)
+            y += h
+        ax.text(icon_x, y + 0.12, note, fontsize=fs(8.5), color="0.4", va="top", linespacing=1.3)
+        self._key_ax = ax
 
     def _persist(self):
         if self.corners_path is not None:
@@ -454,27 +690,56 @@ class GridAdjuster:
         k = int(np.argmin(d))
         return k if d[k] <= self.pick_radius else None
 
+    def _chamber_at(self, x, y):
+        """The (row, col) of the chamber whose ROI contains (x, y); None elsewhere."""
+        cx, cy = self.centers()
+        d = np.hypot(cx - x, cy - y)
+        r, c = np.unravel_index(np.argmin(d), d.shape)
+        return (int(r), int(c)) if d[r, c] <= self.radius else None
+
     def _on_press(self, e):
-        # while the toolbar's zoom/pan tool is active, clicks belong to it, not the corners
+        # while the toolbar's zoom/pan tool is active, clicks belong to it, not the grid
         toolbar = getattr(self.fig.canvas, "toolbar", None)
         if toolbar is not None and str(getattr(toolbar, "mode", "")):
             return
-        if e.inaxes is self.ax and e.xdata is not None:
+        if e.inaxes is not self.ax or e.xdata is None:
+            return
+        # a chamber other than the corner ones: a local correction (right-click removes it)
+        rc = self._chamber_at(e.xdata, e.ydata)
+        corners = {(0, 0), (0, self.n_cols - 1), (self.n_rows - 1, self.n_cols - 1), (self.n_rows - 1, 0)}
+        if rc is not None and rc not in corners:
+            if e.button == 3:
+                if self.controls.pop(rc, None) is not None:
+                    self._persist_warp()
+                    self._redraw()
+            elif e.button == 1:
+                cx, cy = self.centers()
+                bx, by = bilinear_grid(self.corners, self.n_rows, self.n_cols)
+                self._drag = ("chamber", rc, (e.xdata, e.ydata), (cx[rc] - bx[rc], cy[rc] - by[rc]))
+                self._start_blit()
+            return
+        if e.button == 1:  # a corner handle
             self._drag = self._nearest(e.xdata, e.ydata)
-            self._start_blit()
+            if self._drag is not None:
+                self._start_blit()
+
+    def _persist_warp(self):
+        """Save the corrections, and the corners they are offsets from."""
+        self._persist()
+        if self.warp_path is not None:
+            self.save_warp()
 
     def _moving(self):
-        """The artists that follow a corner drag: the grid, its rings and labels, the handles."""
+        """The artists that follow a drag: the grid, its rings and labels, the handles and the
+        local corrections."""
         return [self._grid_pts, self._roi, self._bg_in, self._bg_out, *self._index_labels,
-                self._corner_pts, *self._labels]
+                self._corner_pts, *self._labels, self._ctrl_pts]
 
     def _start_blit(self):
         """For a drag: draw everything once without the moving artists and keep that as the
         background, so each move redraws only the grid (blitting). A full redraw on every
         move is what makes dragging lag. Falls back to full redraws where blitting is
         unsupported."""
-        import time
-
         self._last_drag_draw = time.monotonic()
         self._background = None
         if not getattr(self.fig.canvas, "supports_blit", False):
@@ -493,9 +758,11 @@ class GridAdjuster:
 
     def _on_motion(self, e):
         if self._drag is not None and e.inaxes is self.ax and e.xdata is not None:
-            import time
-
-            self.corners[self._drag] = [e.xdata, e.ydata]
+            if isinstance(self._drag, tuple):  # a local correction
+                _, rc, (x0, y0), (dx0, dy0) = self._drag
+                self.controls[rc] = (dx0 + e.xdata - x0, dy0 + e.ydata - y0)
+            else:
+                self.corners[self._drag] = [e.xdata, e.ydata]
             now = time.monotonic()
             if now - getattr(self, "_last_drag_draw", 0.0) < 1.0 / self.DRAG_FPS:
                 return  # throttled: the release (or the next move) draws the latest position
@@ -513,8 +780,10 @@ class GridAdjuster:
         if self._drag is not None:
             self._update_artists()
             self._end_blit()
-            if self.corners_path is not None:
-                self.save_corners()  # auto-persist placement after each drag
+            if isinstance(self._drag, tuple):
+                self._persist_warp()
+            else:
+                self._persist()  # auto-persist placement after each drag
         self._drag = None
 
     @staticmethod
@@ -542,3 +811,14 @@ class GridAdjuster:
         self._corner_pts.set_data(self.corners[:, 0], self.corners[:, 1])
         for lab, (x, y) in zip(self._labels, self.corners):
             lab.set_position((x, y))
+
+        if hasattr(self, "_ctrl_pts"):  # local corrections, and their count above the image
+            rc = list(self.controls)
+            self._ctrl_pts.set_data([cx[r, c] for r, c in rc], [cy[r, c] for r, c in rc])
+            n = len(rc)
+            self.ax.set_title(
+                "drag the cyan corners to place the grid, then any circle to fix it locally\n"
+                f"{n} local correction{'s' if n != 1 else ''}"
+                + (f" → {self.warp_path.name}" if self.warp_path else " (not saved: no warp_path)"),
+                fontsize=10,
+            )

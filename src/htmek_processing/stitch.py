@@ -310,6 +310,73 @@ def stitch_to_zarr(
     return xr.open_zarr(dst, consolidated=False)
 
 
+def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0):
+    """The seam geometry of a tiled acquisition, measured once and kept: measure_tile_overlaps
+    on `frame` (default the last; a textured frame fits best), saved to `path` (JSON) with what
+    it was measured on, and read back from there on later runs (delete it to measure again).
+
+    Raises if the tiles are left more than `max_cross_px` apart across the seams (cross_dy,
+    cross_dx): the camera's rotation is then off (Kinetix: -2.15 deg on MBO-049, 2026-10-23;
+    -1.94 on MBO-041). The per-gap spread is not checked: on dim images (GFP) it is noisy at
+    single gaps while the overlaps themselves agree. Returns the geometry dict, for
+    stitch_to_zarr(overlap=...)."""
+    import json
+
+    path = Path(path)
+    if not path.exists():
+        tiled = open_tiled(src)
+        lead = [d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] > 1]
+        n = tiled.sizes[lead[0]] if lead else 1
+        k = frame % n
+        geometry = measure_tile_overlaps(src, rotation_deg=rotation_deg, frame=k)
+        geometry.update(measured_on=f"{Path(src).name}, frame {k}", rotation_deg=rotation_deg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(geometry, indent=1))
+    geometry = json.loads(path.read_text())
+    worst = max(abs(geometry["cross_dy"]), abs(geometry["cross_dx"]))
+    if worst > max_cross_px:
+        raise ValueError(f"{path}: tiles left {worst:.1f} px apart across the seams "
+                         f"(measured on {geometry.get('measured_on', '?')}): check rotation_deg")
+    return geometry
+
+
+def fit_flatfield(src, path, *, camera_offset=80.0):
+    """The BaSiC pseudo flatfield of one acquisition (one camera tile, mean 1), fitted from
+    its own tiles by the package's fit_flatfield.py in a throwaway uv environment (basicpy
+    needs its own pins), unless `path` (.tif, with a .json of stats beside it) exists.
+    `camera_offset` (counts) is subtracted from the tiles first. Returns `path`."""
+    import os
+    import subprocess
+
+    path = Path(path)
+    if not path.exists():
+        script = Path(__file__).with_name("fit_flatfield.py")
+        subprocess.run(["uv", "run", str(script), str(src), str(path), str(camera_offset)],
+                       check=True, env={**os.environ, "PYTHONNOUSERSITE": "1"})
+    return path
+
+
+def stitch_run(src, dst, *, camera, geometry_path, flatfield_path, seam_frame=-1, max_cross_px=3.0):
+    """The standard way in for a tiled acquisition (an assay's kinetic run, a GFP or Cy5 scan):
+    seams measured or reused (stitch_geometry), flatfield fitted or reused (fit_flatfield),
+    then flatfield-corrected, rotated and stitched to the zarr store `dst` (stitch_to_zarr;
+    reopened if it exists). `camera` is {"rotation_deg": ..., "offset": ...}.
+
+    Returns a dict: image (the lazy (time, y, x) or (y, x) stitched image), store (the
+    stitched dataset, with its attrs: seams_y / seams_x, tile_px, ...), tiled (the raw
+    acquisition, with its attrs: substrate, filter, camera, start_time, ...), geometry, and
+    pass_s (each frame's first tile, in s since the run started; None for a snapshot)."""
+    geometry = stitch_geometry(src, geometry_path, rotation_deg=camera["rotation_deg"],
+                               frame=seam_frame, max_cross_px=max_cross_px)
+    flat = fit_flatfield(src, flatfield_path, camera_offset=camera["offset"])
+    store = stitch_to_zarr(src, dst, flatfield=flat, offset=camera["offset"],
+                           rotation_deg=camera["rotation_deg"], overlap=geometry)
+    tiled = open_tiled(src)
+    seconds = tiled["seconds"].values
+    pass_s = np.nanmin(seconds.reshape(seconds.shape[0], -1), axis=1) if seconds.ndim == 3 else None
+    return dict(image=store["image"], store=store, tiled=tiled, geometry=geometry, pass_s=pass_s)
+
+
 def tile_seam_flags(x, y, radius, pitch_x, pitch_y=None):
     """Which chambers' ROIs touch a tile seam in a stitched image.
 

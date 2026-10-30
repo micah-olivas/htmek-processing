@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from .plots import FIT_COLORS
-from .fit import four_pl, michaelis_menten
+from ..plots import FIT_COLORS
+from ..fit import four_pl, michaelis_menten
 
 
 # Version of the chamber report's layout and content. Bump it whenever the report changes
@@ -98,14 +98,18 @@ def _ordinal(k):
 
 
 def _fmt(v):
-    """Format one table value: yes/no for booleans, thousands separators for big numbers,
-    3 significant figures otherwise, and ×10ⁿ for tiny ones."""
+    """Format one table value: yes/no for booleans, thousands separators up to a million,
+    ×10ⁿ (3 significant figures) for larger and for tiny ones, so every value fits its cell,
+    3 significant figures otherwise."""
     if isinstance(v, (bool, np.bool_)):
         return "yes" if v else "no"
     if not isinstance(v, (int, float, np.number)):
         return str(v)
     if not np.isfinite(v):
         return "–"
+    if abs(v) >= 1e6:   # wider than a table cell with separators
+        exp = int(np.floor(np.log10(abs(v))))
+        return f"{v / 10**exp:.2f}×10$^{{{exp}}}$"
     if abs(v) >= 1000:
         return f"{v:,.0f}"
     if isinstance(v, (int, np.integer)):
@@ -149,6 +153,62 @@ def _grid_table(
             cell.set_text_props(color="0.25")
 
 
+# a run marked True in this column of the rates was left out of the MM fits: drawn as an x
+# on the MM panels (runs depleted early are now kept, with a forced 4PL: force_4pl_on_depleted)
+EXCLUDED_COL = "left_out_of_mm"
+
+
+def _excluded(df):
+    """Boolean mask of `df`'s rows left out of the MM fits (EXCLUDED_COL; none without it)."""
+    if df is None or EXCLUDED_COL not in df.columns:
+        return np.zeros(0 if df is None else len(df), bool)
+    return df[EXCLUDED_COL].fillna(False).astype(bool).to_numpy()
+
+
+ZOOM_FRAMES = 4  # the zoom inset on each progress curve shows its first ZOOM_FRAMES frames
+
+
+def _early_zoom(ax, d, value, f, is_4pl, lo, hi):
+    """Small inset on a progress-curve panel: the run's first ZOOM_FRAMES frames with the
+    model that gives its rate, the 4PL and its tangent (orange; purple when forced) or the
+    straight line (gray), so the quality of the initial rate is visible. It sits at the right,
+    top or bottom, whichever the curve's right half leaves free (`lo`, `hi`: the y range)."""
+    tm, ym = d["seconds"].mean(), d[value].mean()  # the line's center, as on the main panel
+    late = d.loc[d["seconds"] >= d["seconds"].quantile(0.55), value]
+    up = ((late.mean() - lo) / (hi - lo or 1)) < 0.5  # the curve's right half is low: inset up top
+    ins = ax.inset_axes([0.63, 0.6 if up else 0.05, 0.34, 0.34])
+    d = d.sort_values("seconds").head(ZOOM_FRAMES)
+    if len(d) < 2:
+        return
+    t_end = d["seconds"].iloc[-1]
+    t = np.linspace(d["seconds"].iloc[0], t_end, 60)
+    ins.plot(d["seconds"], d[value], "o", ms=2.6, color="0.45", mec="k", mew=0.3, zorder=3)
+    if not is_4pl and np.isfinite(f.get("slope_line", np.nan)):  # the line, when it gives the rate
+        ins.plot(t, ym + f["slope_line"] * (t - tm), color=FIT_COLORS["line"], lw=0.7, zorder=2)
+    if is_4pl and all(np.isfinite(f.get(k, np.nan)) for k in "adcb"):  # the 4PL, when it gives the rate
+        ins.plot(t, four_pl(t, f["a"], f["d"], f["c"], f["b"]), color=FIT_COLORS["4pl"], lw=1.0, zorder=2)
+        tp = f["t_peak"] if np.isfinite(f["t_peak"]) else t[0]
+        tp = float(np.clip(tp, t[0], t_end))
+        slope = f.get("v0_unsubtracted", f["vmax"])
+        slope = f["vmax"] if not np.isfinite(slope) else slope
+        ins.plot(t, four_pl(tp, f["a"], f["d"], f["c"], f["b"]) + slope * (t - tp),
+                 color=FIT_COLORS["vmax_forced" if f["model"] == "4pl_forced" else "vmax"],
+                 lw=0.6, zorder=2)
+    y = d[value].to_numpy(float)
+    pad = 0.25 * (np.ptp(y) or 1)
+    ins.set_xlim(t[0] - 0.08 * (t_end - t[0]), t_end * 1.05)
+    ins.set_ylim(y.min() - pad, y.max() + pad)
+    ins.set_xticks([])
+    ins.set_yticks([])
+    for sp in ins.spines.values():
+        sp.set_visible(True)
+        sp.set_linewidth(0.5)
+        sp.set_color("0.4")
+    ins.set_facecolor("white")
+    ins.set_zorder(5)
+    ins.keep_frame = True
+
+
 def _left_out(fit):
     """The [S] a fit left out (fit_mm_one_out), or None when it used every point."""
     if fit is None:
@@ -164,7 +224,8 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
     A chamber whose MM fit passes the filter (its (mark_row, mark_col) is in `good`; for
     this chamber, `this_good`) is drawn with filled circles and a solid curve. One that
     fails is drawn with open circles and a dashed curve, as in the Km strip. A point its
-    fit left out (a conditional pass, fit_mm_one_out) is drawn as an x."""
+    fit left out (a conditional pass, fit_mm_one_out, or a run marked in EXCLUDED_COL) is
+    drawn as an x."""
     s_grid = np.linspace(0, s_max, 100)  # linear [S], from 0
     rep_left = {}  # (mark_row, mark_col) -> the [S] its fit left out
     if rep_fits is not None and "left_out" in rep_fits.columns:
@@ -176,6 +237,7 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
     if reps is not None and len(reps):
         out = np.asarray([rep_left.get((r_, c_)) == b for r_, c_, b in
                           zip(reps["mark_row"], reps["mark_col"], reps["bzp_uM"])], bool)
+        out |= _excluded(reps)
         ax.scatter(  # left out of their chamber's fit: x
             reps.loc[out, "bzp_uM"],
             reps.loc[out, y],
@@ -234,6 +296,11 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
         ax.plot(out["bzp_uM"], out[y], "x", ms=7, mew=1.6, color=REPORT_COLORS["this"],
                 zorder=4)
         this = this[this["bzp_uM"] != left]
+    if this is not None and _excluded(this).any():  # runs left out of every MM fit
+        out = _excluded(this)
+        ax.plot(this.loc[out, "bzp_uM"], this.loc[out, y], "x", ms=7, mew=1.6,
+                color=REPORT_COLORS["this"], zorder=4)
+        this = this[~out]
     if this is not None:
         ax.plot(
             this["bzp_uM"],
@@ -262,7 +329,8 @@ _REPORT_STYLE = {
     "ytick.labelsize": 11,
     "legend.fontsize": 11.5,
 }
-_AXIS_LABELS = {"nadh_uM": "[NADH] (µM)", "median_bc": "NADH signal (a.u.)"}
+_AXIS_LABELS = {"nadh_uM": "[NADH] (µM)", "median_bc": "NADH signal (a.u.)",
+                "chamber_ROI_median_bc": "chamber ROI median (RFU)", "chamber_ROI_median": "chamber ROI median (RFU)"}
 
 
 def _report_page(page, value, norm_col):
@@ -281,6 +349,7 @@ def _report_page(page, value, norm_col):
     runs, fits = page["runs"], page["fits"]
     r, c, tag = page["row"], page["col"], page["tag"]
     enzyme = norm_col.split("_per_")[-1]
+    rate_unit = page.get("rate_unit", "µM/s")
     col = [P["left"] + k * (P["col_w"] + P["gap"]) for k in range(6)]  # left edges
     km = page.get("km")  # Km strip, when raw MM fits were given
     # rows, as (top, height) in inches from the top of the page
@@ -368,24 +437,44 @@ def _report_page(page, value, norm_col):
             for name, key in [("K$_m$ (µM)", "km"), ("v$_{max}$", "vmax"), ("r²", "r2")]
         ]
         # which runs each fit uses: all, or all but the one a conditional pass left out
-        mm_rows.append(["fit", *("" if f is None else "all runs" if _left_out(f) is None
-                                 else f"w/o {_fmt(_left_out(f))}" for f in fits_mm)])
+        n_dep = int(_excluded(fits).sum()) if len(fits) else 0  # runs left out of the MM fits
+
+        def runs_used(f):
+            if f is None:
+                return ""
+            out = [_fmt(_left_out(f))] if _left_out(f) is not None else []
+            out += [f"{n_dep} run{'s' * (n_dep > 1)}"] if n_dep else []
+            return "w/o " + ", ".join(out) if out else "all runs"
+
+        mm_rows.append(["fit", *(runs_used(f) for f in fits_mm)])
         # the Km filter (r² of the raw fit, as in the Km strip): flag failing r² cells
         # and report pass/fail for the chamber
         min_r2 = page["km_min_r2"]
         fills = {
-            (2, j + 1): REPORT_COLORS["fail"]
+            (2, j + 1): REPORT_COLORS["warn"]  # low r²: a flag (Km not set), not a fail
             for j, f in enumerate(fits_mm)
             if f is not None and not f["r2"] >= min_r2
         }
         raw_ok = page["mm_raw"] is not None and page["mm_raw"]["r2"] >= min_r2
         conditional = raw_ok and _left_out(page["mm_raw"]) is not None
-        verdict = "conditional" if conditional else "pass" if raw_ok else "fail"
+        # a low r² is a flag, not a fail: the fit can still bound Vmax (amber)
+        verdict = "conditional" if conditional else "pass" if raw_ok else "low"
         info = [*page["info"], [f"r² ≥ {min_r2}", verdict]]
+        fills[(len(info) - 1, 4)] = REPORT_COLORS["pass" if raw_ok and not conditional else "warn"]
+        # overall: the chamber fails only if its enzyme readout is not above its floor (every
+        # `info_floors` entry, e.g. the GFP floor); a raw MM fit below the r² filter leaves
+        # its Vmax ("vmax only"), not its Km
+        e_ok = all(
+            isinstance(v, (int, float, np.number)) and v > page["info_floors"][lab]
+            for lab, v in page["info"] if lab in page["info_floors"]
+        )
+        overall = ("fail" if not e_ok else "vmax only" if not raw_ok
+                   else "conditional" if conditional else "pass")
+        info.append(["overall", overall])
         fills[(len(info) - 1, 4)] = REPORT_COLORS[
-            "warn" if conditional else "pass" if raw_ok else "fail"]
+            {"pass": "pass", "conditional": "warn", "vmax only": "warn", "fail": "fail"}[overall]]
         for j, f in enumerate(fits_mm):  # a fit that left a run out: amber
-            if _left_out(f) is not None:
+            if f is not None and (_left_out(f) is not None or n_dep):
                 fills[(3, j + 1)] = REPORT_COLORS["warn"]
 
         # chamber details that fail a filter (red) or carry a flag (amber), in the value
@@ -400,8 +489,8 @@ def _report_page(page, value, norm_col):
         n = max(len(mm_rows), len(info))
         mm_rows += [["", "", ""]] * (n - len(mm_rows))
         info = info + [["", ""]] * (n - len(info))
-        widths = [0.74, 0.8, 0.86, 0.8, 0.88]  # inches, snug around the text ("w/o 2,500",
-        #                                       "conditional")
+        widths = [0.74, 0.8, 0.86, 0.88, 0.8]  # inches, snug around the text ("w/o 2,500",
+        #                                       "conditional"); the chamber labels get the room
         row_h = 0.23
         ax = box(col[0], top_a, sum(widths), row_h * (n + 1))
         fig.key["table"] = ax
@@ -416,7 +505,7 @@ def _report_page(page, value, norm_col):
             fills=fills,
         )
         ax.annotate(
-            f"v$_{{max}}$ in µM/s (raw), µM/s per {enzyme} count (per [E])",
+            f"v$_{{max}}$ in {rate_unit} (raw), {rate_unit} per {enzyme} count (per [E])",
             (0, 0),
             xycoords="axes fraction",
             xytext=(0, -3),
@@ -458,6 +547,10 @@ def _report_page(page, value, norm_col):
                 sp.set_color("black")
                 sp.set_linewidth(0.8)
             ax.keep_frame = True  # exempt from the page-wide top/right spine removal
+            caption = page.get("image_captions", {}).get(label)
+            if caption:  # e.g. the source acquisition, under the crop
+                ax.text(0.5, -0.03, caption, transform=ax.transAxes, ha="center", va="top",
+                        fontsize=6.5, color="black")
 
             # button-QC tab (chamberqc), bottom left of the crop, outlined in black
             tab = page.get("qc_tabs", {}).get(label)
@@ -472,8 +565,10 @@ def _report_page(page, value, norm_col):
         # when this chamber's (raw) MM fit fails the filter, as everywhere on the page
         passes_filter = (r, c) in page["good_raw"]
         g = page["traces"]
-        lo, hi = np.nanmin(g[value]), np.nanmax(g[value])
-        t_max = g["seconds"].max()
+        v = g[value].to_numpy(float)
+        # a chamber with no finite signal (e.g. its ROI off the image) still gets a page
+        lo, hi = (np.nanmin(v), np.nanmax(v)) if np.isfinite(v).any() else (0.0, 1.0)
+        t_max = np.nanmax(g["seconds"]) if np.isfinite(g["seconds"]).any() else 1.0
         axs = []
         for k, bzp in enumerate(runs):
             ax = box(col[k], top_b, P["col_w"], h_b)
@@ -498,7 +593,8 @@ def _report_page(page, value, norm_col):
             if bzp in fits.index:
                 f = fits.loc[bzp]
                 t = np.linspace(d["seconds"].min(), d["seconds"].max(), 100)
-                if f["model"] == "4pl":
+                is_4pl = f["model"] in ("4pl", "4pl_forced")
+                if is_4pl:
                     ax.plot(
                         t,
                         four_pl(t, f["a"], f["d"], f["c"], f["b"]),
@@ -506,11 +602,18 @@ def _report_page(page, value, norm_col):
                         lw=1.5,
                         zorder=2,
                     )
-                    yp = four_pl(f["t_peak"], f["a"], f["d"], f["c"], f["b"])
+                    # the tangent where the rate was read: the 4PL's steepest point, or for a
+                    # forced 4PL whose peak is before the run (or b <= 1), the first frame; its
+                    # slope is the fitted one, before any BLANK subtraction
+                    tp = f["t_peak"] if np.isfinite(f["t_peak"]) else t[0]
+                    tp = float(np.clip(tp, t[0], t[-1]))
+                    slope = f.get("v0_unsubtracted", f["vmax"])
+                    slope = f["vmax"] if not np.isfinite(slope) else slope
+                    yp = four_pl(tp, f["a"], f["d"], f["c"], f["b"])
                     ax.plot(
                         t,
-                        yp + f["vmax"] * (t - f["t_peak"]),
-                        color=FIT_COLORS["vmax"],
+                        yp + slope * (t - tp),
+                        color=FIT_COLORS["vmax_forced" if f["model"] == "4pl_forced" else "vmax"],
                         lw=0.8,
                         zorder=2,
                     )
@@ -523,26 +626,19 @@ def _report_page(page, value, norm_col):
                         lw=0.9,
                         zorder=2,
                     )
-                # the rate and the model it comes from, in whichever corner the curve
-                # leaves free: top-left, unless the curve starts in the upper half
-                early = d.loc[d["seconds"] <= d["seconds"].quantile(0.3), value].mean()
-                high = (early - lo) / (hi - lo or 1) > 0.45
+                # the rate as the panel's right title, colored by the model it comes from
+                # (4PL, forced 4PL or line, as in the legend)
                 ax.key_model = f["model"]
-                fig.key["insets"][bzp] = ax.text(
-                    0.95 if high else 0.05,
-                    0.06 if high else 0.94,
-                    ("4PL" if f["model"] == "4pl" else "linear")
-                    + f"\n{_fmt(f['vmax'])} µM/s",
-                    transform=ax.transAxes,
-                    ha="right" if high else "left",
-                    va="bottom" if high else "top",
-                    fontsize=10,
-                    linespacing=1.15,
-                    color=FIT_COLORS["vmax"] if f["model"] == "4pl" else "0.4",
-                    zorder=6,
-                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1),
+                _early_zoom(ax, d, value, f, is_4pl, lo, hi)
+                fig.key["insets"][bzp] = ax.set_title(
+                    f"{_fmt(f['vmax'])}\n{rate_unit}",
+                    loc="right",
+                    fontsize=8.5,
+                    linespacing=1.05,
+                    color={"4pl": FIT_COLORS["vmax"], "4pl_forced": FIT_COLORS["vmax_forced"]}.get(
+                        f["model"], "0.4"),
                 )
-            ax.set_title(title, fontsize=11.5)
+            ax.set_title(title, loc="left", fontsize=11)  # the run's [S]
             ax.set_xlim(0, t_max * 1.04)  # every run on the same time axis, from 0
             ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=2, steps=[1, 2, 5, 10]))
         pad = 0.06 * (hi - lo or 1)
@@ -576,7 +672,11 @@ def _report_page(page, value, norm_col):
             good=page["good_raw"],
             this_good=(r, c) in page["good_raw"],
         )
-        ax.set_title("v$_0$ (µM/s)", loc="left", fontsize=11.5)  # each run's initial rate
+        blank = page.get("blank_curve") or {}
+        if blank:   # the BLANKs' median rate per run, under everything else
+            ax.plot(list(blank), list(blank.values()), "s-", ms=3.5, lw=1.0, color="0.6", mec="0.35",
+                    mew=0.4, zorder=1.5)
+        ax.set_title(f"v$_0$ ({rate_unit})", loc="left", fontsize=11.5)  # each run's initial rate
         fig.key["count"] = ax.text(  # how many chambers of this variant are overlaid
             0.04,
             0.96,
@@ -642,7 +742,7 @@ def _report_page(page, value, norm_col):
             ax.set_ylim(min(lo, 0), max(hi, wt_vmax * k * 1.12))
         unit = "" if exp == 0 else f"×10$^{{{exp}}}$ "
         ax.set_title(
-            f"v$_0$ / {enzyme} ({unit}µM/s per count)",
+            f"v$_0$ / {enzyme} ({unit}{rate_unit} per count)",
             loc="left",
             fontsize=11.5,
         )
@@ -739,15 +839,6 @@ def _report_page(page, value, norm_col):
                 [],
                 [],
                 marker="o",
-                ms=4,
-                lw=0.8,
-                color=REPORT_COLORS["replicate"],
-                label=f"other {tag} chambers",
-            ),
-            plt.Line2D(
-                [],
-                [],
-                marker="o",
                 ls="--",
                 ms=5,
                 lw=0.8,
@@ -756,16 +847,20 @@ def _report_page(page, value, norm_col):
                 mew=1.0,
                 label=f"open, dashed: r² < {page['km_min_r2']}",
             ),
-            plt.Line2D([], [], color=FIT_COLORS["4pl"], lw=1.5, label="4PL fit"),
             plt.Line2D(
                 [], [], color=FIT_COLORS["vmax"], lw=0.8, label="v$_0$ (4PL tangent)"
             ),
+            plt.Line2D([], [], color=FIT_COLORS["vmax_forced"], lw=0.8,
+                       label="v$_0$ (forced 4PL: depleted early)"),
             plt.Line2D([], [], color=FIT_COLORS["line"], lw=0.9, label="line fit"),
             plt.Line2D([], [], ls="", marker="x", ms=6, mew=1.4, color=REPORT_COLORS["this"],
                        label="x: left out of the fit"),
             plt.Line2D([], [], ls="--", lw=1.0, color=REPORT_COLORS["wt"],
                        label="WT v$_{max}$ / [E] (median, passing)"),
         ]
+        if page.get("blank_curve"):
+            handles.append(plt.Line2D([], [], marker="s", ms=3.5, lw=1.0, color="0.6", mec="0.35", mew=0.4,
+                                      label="BLANK median v$_0$"))
         key.legend(
             handles=handles,
             loc="upper left",
@@ -780,16 +875,16 @@ def _report_page(page, value, norm_col):
             strip_w = col[2] + P["col_w"] - col[0]
             fig.key["km"] = box(col[0], top_d, strip_w, h_d)
             fig.key["km_data"] = km
-            _km_row(fig.key["km"], km, tag, legend=False)
+            _km_row(fig.key["km"], km, tag, log=2, legend=False)
             fig.key["vmax_strip"] = box(col[3], top_d, strip_w, h_d)
             fig.key["vmax_data"] = vm
             _km_row(fig.key["vmax_strip"], vm, tag, name="v$_{max}$ / [E]",
-                    unit=f"µM/s per {enzyme} count", log=True, legend=False)
+                    unit=f"{rate_unit} per {enzyme} count", log=True, legend=False)
             # no key under the strips: the gray points and off-scale triangles are in the key page
         elif km is not None:
             fig.key["km"] = box(col[0], top_d, col[3] + P["col_w"] - col[0], h_d)
             fig.key["km_data"] = km
-            _km_row(fig.key["km"], km, tag)  # its own key: cols 5-6
+            _km_row(fig.key["km"], km, tag, log=2)  # its own key: cols 5-6
         # header, top right: the experiment (name, library, date)
         if page.get("experiment"):
             right_edge = col[5] + P["col_w"]  # aligned with the right edge of the crops
@@ -887,9 +982,19 @@ def _chip_map(ax, chip_rc, tag_rc, this, good=frozenset()):
     ax.set_title("chip", fontsize=11.5)  # like the image-crop titles
 
 
+def _log_minor_ticks(axis):
+    """Unlabeled minor ticks on a log axis, at 2-9 x each power of 10 (on base-2 axes too, so
+    the minor ticks mark round numbers whatever the major ticks are)."""
+    ticker = plt.matplotlib.ticker
+    axis.set_minor_locator(ticker.LogLocator(base=10, subs=np.arange(2, 10), numticks=100))
+    axis.set_minor_formatter(ticker.NullFormatter())
+
+
 def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
     """Every chamber's value (Km by default) as a thin horizontal strip. The axis runs to
-    km["xmax"] (for Km, the highest [S]), linear from 0, or with `log` from km["xmin"];
+    km["xmax"] (for Km, the highest [S]), linear from 0, or with `log` from km["xmin"]
+    (log=True: base 10; log=2: base 2, ticked at each doubling from xmin, i.e. at each [S]
+    of a two-fold dilution series);
     values beyond it are off scale and sit at the edge as triangles (> above, < below).
     Other variants are gray: every chamber with a value, all as the same small point. This
     variant's other chambers are light blue and this chamber dark blue, both outlined in
@@ -901,9 +1006,16 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
     xmin = km.get("xmin", 0.0) if log else 0.0
 
     # the axis first, so the median labels below are placed against the final scale
-    if log:
+    if log == 2:
+        ax.set_xscale("log", base=2)
+        ax.set_xlim(xmin / 1.15, xmax * 1.15)
+        ticks = xmin * 2.0 ** np.arange(int(np.floor(np.log2(xmax / xmin) + 1e-9)) + 1)
+        ax.set_xticks(ticks, [f"{t:,g}" for t in ticks])
+        _log_minor_ticks(ax.xaxis)
+    elif log:
         ax.set_xscale("log")
         ax.set_xlim(xmin / 1.15, xmax * 1.15)
+        _log_minor_ticks(ax.xaxis)
     else:
         ax.set_xlim(0, xmax * 1.03)
     ax.set_ylim(-0.32, 0.75)  # points jitter within +/- 0.2; the band above is for labels
@@ -911,7 +1023,7 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
     def placed(values):
         """Each value, or the axis edge it lies beyond, and which side ('', '>', '<')."""
         values = np.asarray(values, float)
-        side = np.where(values > xmax, ">", np.where(log & ~(values >= xmin), "<", ""))
+        side = np.where(values > xmax, ">", np.where(bool(log) & ~(values >= xmin), "<", ""))
         return np.clip(values, xmin, xmax), side
 
     def strip(points, size, color, edge, z, label=None):
@@ -1028,9 +1140,9 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
                label=f"open: r² < {km['min_r2']}")
     ax.set_yticks([])
     ax.set_xlabel(f"{name} ({unit})" if unit else name)
-    if log:
+    if log and log != 2:  # base 2 keeps its [S] tick labels
         ax.xaxis.set_major_formatter(plt.matplotlib.ticker.LogFormatterSciNotation())
-        ax.xaxis.set_minor_formatter(plt.NullFormatter())
+        _log_minor_ticks(ax.xaxis)
     ax.spines["left"].set_visible(False)
     ax.set_title(
         f"{name}, all chambers (n={km['n_all']}; {km['n']} with r² ≥ {km['min_r2']})",
@@ -1469,6 +1581,9 @@ def chamber_report_pdf(
     calibration=None,
     standards_value="median",
     standards_zoom_um=125,
+    rate_unit="µM/s",
+    image_captions=None,
+    image_pct_high=None,
 ):
     """One PDF page per chamber, for reviewing chambers one by one.
 
@@ -1515,6 +1630,19 @@ def chamber_report_pdf(
     line's slope and r², and an inset zoomed on the standards up to `standards_zoom_um`.
     The key then moves to a band under that row.
 
+    `rate_unit` labels every rate on the page: "µM/s" once the signal is calibrated to [NADH]
+    (the default, MBO-040), "RFU/s" while it is still raw. The normalized rate is labeled
+    `rate_unit` per count of the enzyme readout.
+
+    `image_captions` = {image label: text} prints a small caption under that crop, e.g.
+    the acquisition it came from. Each image's contrast runs from the 1st to the 99.5th
+    percentile of its chambers' area; `image_pct_high` = {image label: percentile} lowers
+    the upper limit (more gain), e.g. for dim GFP buttons.
+
+    The table's "overall" cell fails the chamber when any `info_floors` value is not above
+    its floor; a raw MM fit below r² >= `km_min_r2` reads "vmax only" (amber): its Km is
+    not determined, but its Vmax can still be reported.
+
     The last page is a key: one chamber's page, shrunk, with each element labeled
     (_report_key_page). `key_chamber` = (mark_row, mark_col) picks the example (default:
     the first of `chambers`); it need not be among `chambers`.
@@ -1535,7 +1663,7 @@ def chamber_report_pdf(
         y0, y1 = int(max(0, np.min(cy) - crop_px)), int(np.max(cy) + crop_px)
         x0, x1 = int(max(0, np.min(cx) - crop_px)), int(np.max(cx) + crop_px)
         limits[label] = tuple(
-            np.percentile(np.asarray(img)[y0:y1:4, x0:x1:4], [1, 99.5])
+            np.percentile(np.asarray(img)[y0:y1:4, x0:x1:4], [1, (image_pct_high or {}).get(label, 99.5)])
         )
 
     # one payload per page with only what that page needs: workers never see whole images
@@ -1573,6 +1701,9 @@ def chamber_report_pdf(
 
     good_raw = passing(mm_raw)
     good_norm = passing(mm)
+    # the BLANK chambers' median rate per run: the floor a rate has to clear, on the v0 panel
+    blank_curve = (rates[rates["tag"] == "BLANK"].groupby("bzp_uM")["vmax"].median().sort_index().to_dict()
+                   if "tag" in rates and (rates["tag"] == "BLANK").any() else {})
     norm_by_tag = dict(list(norm.groupby("tag"))) if norm is not None else {}
     rates_by_tag = dict(list(rates.groupby("tag")))
 
@@ -1589,7 +1720,7 @@ def chamber_report_pdf(
     km_ok = None
     if mm_raw is not None:
         km_all = mm_raw.dropna(subset=["km"]).sort_values(key).copy()
-        km_xmax = max(runs)  # axis limit: the highest [S]
+        km_xmin, km_xmax = min(runs), max(runs)  # axis limits: the lowest and highest [S]
         # one fixed vertical jitter per chamber, so the strip is identical on every page
         km_all["jitter"] = np.random.default_rng(0).uniform(-0.2, 0.2, len(km_all))
         km_all["passes"] = km_all["r2"] >= km_min_r2
@@ -1679,6 +1810,9 @@ def chamber_report_pdf(
                 rep_mm=others(of_tag(mm, tag), r, c),
                 good_raw=good_raw,
                 good_norm=good_norm,
+                rate_unit=rate_unit,
+                blank_curve=blank_curve,
+                image_captions=image_captions or {},
                 standards=None
                 if standards is None or (r, c) not in std_by
                 else dict(
@@ -1710,6 +1844,7 @@ def chamber_report_pdf(
                     min_r2=km_min_r2,
                     # every other variant's chamber with a Km (passing or not)
                     others=km_all.loc[km_all["tag"] != tag, cols].to_numpy(float),
+                    xmin=km_xmin,
                     xmax=km_xmax,
                     wt=km_wt,
                     # median Km of this variant's chambers that pass the filter
