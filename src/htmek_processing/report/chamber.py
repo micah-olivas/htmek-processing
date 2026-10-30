@@ -210,6 +210,33 @@ def _early_zoom(ax, d, value, f, is_4pl, lo, hi):
     ins.keep_frame = True
 
 
+def _label_standards(ax, conc, val, line, fontsize=7.5):
+    """Label the standards of the zoom inset with their [NADH]: each label anchored on the
+    fitted line at its concentration (not on the point, which scatters about it), all at the
+    same offset to the right of and below the line, so they form an even staircase in
+    ascending order on every page. Where the line is nearly flat (a poor standard curve), the
+    labels go above it instead, each one line height higher, so they never overlap. Without a line, beside
+    each point (see the call in _report_page)."""
+    offset = np.array([5.0, -5.0]) * ax.figure.dpi / 72  # right of and below the line (px)
+    if line is None:
+        for c, v in zip(conc, val):
+            ax.annotate(f"{c:g}", (c, v), xytext=(5, -5), textcoords="offset points", ha="left",
+                        va="top", fontsize=fontsize, zorder=6)
+        return
+    to_px, to_data = ax.transData.transform, ax.transData.inverted().transform
+    on_line = to_px(np.c_[conc, line["slope"] * np.asarray(conc) + line["intercept"]])
+    rise = np.diff(on_line[:, 1]).min() if len(conc) > 1 else 0
+    step = 1.15 * fontsize * ax.figure.dpi / 72  # one line height (px)
+    flat = rise < step
+    for i, (c, v) in enumerate(sorted(zip(conc, val))):
+        if flat:  # above the line, each label one line height higher (a flat line sits low)
+            spot = on_line[i] + offset * [1, -1] + [0, step * i]
+        else:
+            spot = on_line[i] + offset
+        ax.annotate(f"{c:g}", (c, v), xytext=to_data(spot), textcoords="data", ha="left",
+                    va="bottom" if flat else "top", fontsize=fontsize, zorder=6)
+
+
 def _left_out(fit):
     """The [S] a fit left out (fit_mm_one_out), or None when it used every point."""
     if fit is None:
@@ -356,10 +383,10 @@ def _report_page(page, value, norm_col):
     # rows, as (top, height) in inches from the top of the page
     top_a = 0.9  # table + image crops
     top_b, h_b = top_a + P["col_w"] + 0.6, 1.15  # progress curves
-    top_c, h_c = top_b + h_b + 1.0, 2.5  # rate-vs-[BzP] panels (square) and key
+    top_c, h_c = top_b + h_b + 0.75, 2.5  # rate-vs-[BzP] panels (square) and key
     std = page.get("standards")  # this chamber's NADH standards and calibration line, if given
     # with the standard curve as a third square, the key moves to a band under the row
-    h_key = 0.95 if std is not None else 0.0
+    h_key = 1.2 if std is not None else 0.0  # the legend band: 3 rows
     top_d, h_d = top_c + h_c + 0.85 + h_key, 0.75  # Km and Vmax / [E] strips
     vm = page.get("vmax")  # the Vmax / [E] strip, when normalized fits were given
     legend_h = 0.4 if km is not None and vm is not None else 0.0  # their shared key
@@ -490,7 +517,7 @@ def _report_page(page, value, norm_col):
         n = max(len(mm_rows), len(info))
         mm_rows += [["", "", ""]] * (n - len(mm_rows))
         info = info + [["", ""]] * (n - len(info))
-        widths = [0.74, 0.8, 0.86, 0.88, 0.8]  # inches, snug around the text ("w/o 2,500",
+        widths = [0.74, 0.8, 0.95, 0.88, 0.8]  # inches, snug around the text ("w/o 2,500",
         #                                       "conditional"); the chamber labels get the room
         row_h = 0.23
         ax = box(col[0], top_a, sum(widths), row_h * (n + 1))
@@ -571,8 +598,16 @@ def _report_page(page, value, norm_col):
         lo, hi = (np.nanmin(v), np.nanmax(v)) if np.isfinite(v).any() else (0.0, 1.0)
         t_max = np.nanmax(g["seconds"]) if np.isfinite(g["seconds"]).any() else 1.0
         axs = []
+        # one panel per run across the grid's width: the grid's columns for up to 6 runs,
+        # narrower panels (same gap) for more
+        if len(runs) <= 6:
+            run_x, run_w = col[: len(runs)], P["col_w"]
+        else:
+            span_w = col[5] + P["col_w"] - col[0]
+            run_w = (span_w - (len(runs) - 1) * P["gap"]) / len(runs)
+            run_x = [col[0] + k * (run_w + P["gap"]) for k in range(len(runs))]
         for k, bzp in enumerate(runs):
-            ax = box(col[k], top_b, P["col_w"], h_b)
+            ax = box(run_x[k], top_b, run_w, h_b)
             fig.key["runs"][bzp] = ax
             if axs:
                 ax.sharey(axs[0])
@@ -627,32 +662,51 @@ def _report_page(page, value, norm_col):
                         lw=0.9,
                         zorder=2,
                     )
-                # the rate as the panel's right title, colored by the model it comes from
-                # (4PL, forced 4PL or line, as in the legend)
+                # the fitted endpoint, net of the run's background (the BLANKs' median at the
+                # first frame): the fit's value at the end of the run, labeled at the
+                # right edge just below the last points, or above them when the curve ends low
+                # (in the trace's units)
+                t_end = d["seconds"].max()
+                if is_4pl:
+                    y_end = four_pl(t_end, f["a"], f["d"], f["c"], f["b"])
+                elif np.isfinite(f["slope_line"]):
+                    y_end = d[value].mean() + f["slope_line"] * (t_end - d["seconds"].mean())
+                else:
+                    y_end = np.nan
+                if np.isfinite(y_end):
+                    unit = "µM" if value.startswith("nadh_uM") else "RFU"
+                    net = y_end - page.get("background0", {}).get(bzp, 0.0)  # above the run's background
+                    # below the points, unless that runs into the x-axis: then just above them
+                    span = (hi - lo) or 1
+                    low_end = (y_end - (lo - 0.06 * span)) / (1.12 * span) < 0.18
+                    fig.key.setdefault("endpoints", {})[bzp] = ax.annotate(
+                        f"{'+' if net >= 0 else '−'}{_fmt(abs(net))} {unit}", (1, y_end),
+                        xycoords=("axes fraction", "data"),
+                        xytext=(-1, 5 if low_end else -5), textcoords="offset points", ha="right",
+                        va="bottom" if low_end else "top",
+                        fontsize=7, zorder=6, annotation_clip=False,
+                        color={"4pl": FIT_COLORS["vmax"], "4pl_forced": FIT_COLORS["vmax_forced"]}.get(
+                            f["model"], "0.4"),
+                    )
+                # the rate on its own line just under the run's [S], colored by the model it
+                # comes from (4PL, forced 4PL or line, as in the legend)
                 ax.key_model = f["model"]
                 _early_zoom(ax, d, value, f, is_4pl, lo, hi)
-                fig.key["insets"][bzp] = ax.set_title(
-                    f"{_fmt(f['vmax'])}\n{rate_unit}",
-                    loc="right",
+                fig.key["insets"][bzp] = ax.annotate(
+                    f"{_fmt(f['vmax'])} {rate_unit}", (0, 1), xycoords="axes fraction",
+                    xytext=(0, 3), textcoords="offset points", ha="left", va="bottom",
                     fontsize=8.5,
-                    linespacing=1.05,
                     color={"4pl": FIT_COLORS["vmax"], "4pl_forced": FIT_COLORS["vmax_forced"]}.get(
                         f["model"], "0.4"),
                 )
-            ax.set_title(title, loc="left", fontsize=11)  # the run's [S]
+            ax.set_title(title, loc="left", fontsize=10.5 if len(runs) > 6 else 11, pad=15)  # the run's [S]
             ax.set_xlim(0, t_max * 1.04)  # every run on the same time axis, from 0
             ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=2, steps=[1, 2, 5, 10]))
+            # the unit on the ticks ("1000 s"): no separate time label under the row
+            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:g} s" if v else "0"))
         pad = 0.06 * (hi - lo or 1)
         axs[0].set_ylim(lo - pad, hi + pad)  # from the data: fit lines end at the edge
         axs[0].set_ylabel(_AXIS_LABELS.get(value, value))
-        row_mid = (col[0] + col[5] + P["col_w"]) / 2  # centered under the progress row
-        fig.text(
-            row_mid / P["w"],
-            1 - (top_b + h_b + 0.32) / H,
-            "time (s)",
-            ha="center",
-            va="top",
-        )
 
         # bottom row: the two rate-vs-[BzP] panels (square), then the key. Each panel's
         # y label sits above it (left-aligned) instead of a title, so the normalized panel
@@ -781,7 +835,7 @@ def _report_page(page, value, norm_col):
                 Y0, Y1 = ax.get_ylim()
                 # room around the points for their labels: the window reaches past the top
                 # standard, and the points sit between 18 % and 80 % of its height
-                z_x1 = low["conc_uM"].max() * 1.3
+                z_x1 = low["conc_uM"].max() * 1.6  # room right of the top standard for its label
                 z_x0 = -0.12 * z_x1
                 y_low = low[std["value"]].to_numpy(float)
                 z_span = (Y1 - Y0) * (z_x1 - z_x0) / (X1 - X0)  # same magnification in y
@@ -791,13 +845,11 @@ def _report_page(page, value, norm_col):
                     z_y0, z_span = np.nanmin(y_low) - z_pad, np.ptp(y_low) + 2 * z_pad
                 zoom.set_xlim(z_x0, z_x1)
                 zoom.set_ylim(z_y0, z_y0 + z_span)
-                # each point labeled with its [NADH] (µM), on the side of the line that is
-                # free: upper left, except the first (at the left edge), to its right
-                for i, (conc, val) in enumerate(zip(low["conc_uM"], low[std["value"]])):
-                    first = i == 0
-                    zoom.annotate(f"{conc:g}", (conc, val), xytext=(5, -1) if first else (-4, 3),
-                                  textcoords="offset points", ha="left" if first else "right",
-                                  va="center" if first else "bottom", fontsize=7.5, zorder=6)
+                # each point labeled with its [NADH] (µM): first on the side of the line away
+                # from the point (above it: upper left; below: lower right), else the first
+                # of a few spots that stays inside the inset and overlaps no earlier label
+                # or point, so close standards (e.g. 31.25 and 62.5) never collide
+                _label_standards(zoom, low["conc_uM"].to_numpy(float), y_low, line)
                 zoom.set_xticks([])  # the points carry their [NADH]
                 zoom.yaxis.set_major_locator(plt.MaxNLocator(2))
                 zoom.yaxis.tick_right()  # clear of the panel's own y labels
@@ -868,7 +920,7 @@ def _report_page(page, value, norm_col):
             frameon=False,
             borderaxespad=0,
             handlelength=1.6,
-            ncol=4 if std is not None else 1,  # a band under the row, or a column beside it
+            ncol=3 if std is not None else 1,  # a band under the row, or a column beside it
             columnspacing=1.2,
         )
         if km is not None and vm is not None:
@@ -1581,7 +1633,7 @@ def chamber_report_pdf(
     standards=None,
     calibration=None,
     standards_value="median",
-    standards_zoom_um=125,
+    standards_zoom_um=62.5,
     rate_unit="µM/s",
     image_captions=None,
     image_pct_high=None,
@@ -1705,6 +1757,12 @@ def chamber_report_pdf(
     # the BLANK chambers' median rate per run: the floor a rate has to clear, on the v0 panel
     blank_curve = (rates[rates["tag"] == "BLANK"].groupby("bzp_uM")["vmax"].median().sort_index().to_dict()
                    if "tag" in rates and (rates["tag"] == "BLANK").any() else {})
+    # each run's background at its first frame: the BLANKs' median signal (e.g. free phosphate in
+    # the mix, turned to NADH by the coupling enzymes before the first image); endpoints are
+    # labeled net of it
+    first = traces.groupby("bzp_uM")["frame"].transform("min") == traces["frame"]
+    background0 = (traces[first & (traces["tag"] == "BLANK")].groupby("bzp_uM")[value].median().to_dict()
+                   if "tag" in traces else {})
     norm_by_tag = dict(list(norm.groupby("tag"))) if norm is not None else {}
     rates_by_tag = dict(list(rates.groupby("tag")))
 
@@ -1813,6 +1871,7 @@ def chamber_report_pdf(
                 good_norm=good_norm,
                 rate_unit=rate_unit,
                 blank_curve=blank_curve,
+                background0=background0,
                 image_captions=image_captions or {},
                 standards=None
                 if standards is None or (r, c) not in std_by

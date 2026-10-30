@@ -1,5 +1,46 @@
 """Initial rates from progress curves: straight lines and 4PL fits, the rules that choose
-between them, early-depletion and fit-quality flags, BLANK subtraction, and rates per enzyme."""
+between them, early-depletion and fit-quality flags, BLANK subtraction, and rates per enzyme.
+
+How one run of one chamber gets its initial rate v0, in order (the standard sequence, as run
+by an experiment's process notebook):
+
+  1. fit_progress_curves: optional bleach correction, then a straight line and a 4PL fitted
+     to the whole progress curve (fit_4pl_rates -> _fit_4pl_summary). v0 is the 4PL's
+     steepest slope when every rule of PROGRESS_4PL_RULES holds, else the line's slope
+     (`model` "4pl" or "linear"; `reason` names the first rule that failed):
+       1. the 4PL beats the line by BIC (its curvature is worth two more parameters);
+       2. it has a steepest point (b > 1);
+       3. that point lies inside the measured time range (no extrapolation);
+       4. its 10-90 % rise spans at least one sampling interval (not a step);
+       5. its rise across the run is >= min_rise_snr x the points' scatter about it;
+       6. [S] rule: its rise across the run is <= max_rise_frac x [S];
+       7. [S] rule: if it plateaus inside the run, the plateau is >= plateau_min_frac x [S].
+     Rules 6-7 apply only with `substrate=` (the signal in [S]'s units, i.e. calibrated).
+  2. flag_poor_4pl: runs whose 4PL fits the whole run with r² < 0.98 get left_out_of_mm (an
+     imaging step mid-run, or a flat trace with no rise above the noise).
+  3. flag_early_depletion: runs kept on the line although the 4PL beats it and rises above
+     the noise, whose steepest slope is at or before the first frame (b <= 1, or the peak
+     before frame 0) and whose half-rise c falls inside the run: substrate largely used up
+     before the second frame, so the line underestimates v0 (`depleted_early`).
+  4. force_4pl_on_depleted: those runs take the 4PL's steepest slope inside the data
+     window instead (slope_4pl_in_window; `model` "4pl_forced"), never an extrapolation.
+  5. subtract_blank_rate: each run's BLANK median v0 is subtracted from every chamber
+     (v0_unsubtracted keeps the fitted rate).
+
+Where the thresholds come from (each was tested against the consistency of the Km it gives:
+within variants, and between MBO-051's high- and low-pulldown halves):
+  min_rise_snr 10, max_rise_frac 1.2, plateau_min_frac 0.5: MBO-040 (2026-10-05).
+  min_r2_4pl 0.98: MBO-051 (2026-10-29); every run outside its 156.25 µM run had
+    r2_4pl >= 0.993 (1st percentile), and 0.98 caught 533 of 576 runs in that run's dip rows.
+  early depletion, half-rise within the run (max_half_rise 1.0): MBO-051 (2026-10-29);
+    median Km CV within variants 0.27 and left/right Km ratio 1.02, against 0.29 / 1.04 with
+    the half-rise in the first half of the run.
+  The [S] rules assume no more product than substrate. On MBO-051 (2026-10-30) fast,
+  high-enzyme chambers made up to ~10x [S] at low [S], so rule 6 rejected their 4PL;
+  without the [S] rules the median Km CV within variants was 0.28 (0.33 with), the
+  left/right ratio 1.05 (1.16), with frames 16-19 of the 78.125 µM run left out. Pass
+  substrate=None when product exceeds [S].
+"""
 
 from __future__ import annotations
 
@@ -440,11 +481,14 @@ def fit_4pl_rates(
     return pd.DataFrame([{**h, **f} for h, f in zip(heads, fits)]).reindex(columns=cols)
 
 
-# The standard 4PL rules for progress curves (MBO-040, 2026-10-05; see _fit_4pl_summary): the 4PL
-# can only rise; its rise across the run is >= 10 x the points' scatter about it; and, when the
-# signal is in the substrate's units (calibrated NADH vs [BzP], µM), it rises at most 1.2 x [S]
-# and, if it levels off inside the run, by at least 0.5 x [S]
-PROGRESS_4PL_RULES = dict(rising=True, min_rise_snr=10, max_rise_frac=1.2, plateau_min_frac=0.5)
+# The standard 4PL rules for progress curves (MBO-040, 2026-10-05; see _fit_4pl_summary and the
+# module docstring for the whole sequence and where each threshold comes from)
+PROGRESS_4PL_RULES = dict(
+    rising=True,          # the 4PL can only go up: its vmax is never negative (a falling trace keeps the line)
+    min_rise_snr=10,      # rule 5: the rise across the run >= 10 x the points' scatter about the 4PL
+    max_rise_frac=1.2,    # rule 6 ([S] units only): the rise across the run <= 1.2 x [S]
+    plateau_min_frac=0.5,  # rule 7 ([S] units only): a 4PL that plateaus in the run rises >= 0.5 x [S]
+)
 
 
 def flag_early_depletion(rates, traces, *, t="seconds", per=("mark_row", "mark_col"), min_rise_snr=10,
@@ -541,6 +585,10 @@ def fit_progress_curves(
       2. a 4PL and a straight line per chamber (fit_4pl_rates), with PROGRESS_4PL_RULES:
          the initial rate `v0` is the 4PL's steepest slope when every rule holds, else the
          line's slope; `model` and `reason` record which and why.
+
+    The standard sequence then continues with flag_poor_4pl, flag_early_depletion,
+    force_4pl_on_depleted and subtract_blank_rate (the module docstring lists every rule and
+    flag, in order, with where its threshold comes from).
 
     `per` keys one fit (e.g. ("bzp_uM", "mark_row", "mark_col") for several runs; the bleach
     curve is then computed per run, i.e. per `per` key other than the chamber's). The [S]
