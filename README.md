@@ -4,7 +4,7 @@ Image processing and analysis for HT-MEK data.
 
 ## Overview
 
-Takes the tiled images (Prismo zarr stores) and a chip layout (pinlist), and performs stitching, per-chamber intensity extraction, kinetic fitting, and QC figures. Supports minichip (8 x 8 chambers) and PS1.8K (56 x 32 chambers) architectures.
+Takes raw experimental images (tiffs or Prismo zarr stores) and a chip layout (pinlist), and performs stitching, per-chamber intensity extraction, kinetic fitting, and QC figures. Supports minichip (8 x 8 chambers) and PS1.8K (56 x 32 chambers) architectures.
 
 ## Installation
 
