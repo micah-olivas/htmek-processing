@@ -1,5 +1,5 @@
 """Grid geometry: chamber centers from a placement, saving and loading placements, and
-snapping a grid onto buttons or spots."""
+snapping or centering a grid onto buttons, spots or chambers."""
 
 from __future__ import annotations
 
@@ -44,10 +44,11 @@ def bilinear_grid(corners, n_rows=8, n_cols=8):
     return P[..., 0], P[..., 1]
 
 
-def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None):
+def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None, dumbbell=None):
     """Save the 4 grid corners [[x,y],...] to JSON. If any of radius/bg_inner/bg_outer is
     given, save the full mask as a dict {corners, radius, bg_inner, bg_outer}; otherwise
-    save a bare corners list. Returns the path."""
+    save a bare corners list. `dumbbell` (the shape, see dumbbell_mask) is saved with them.
+    Returns the path."""
     import json
 
     corners = np.asarray(corners, float).tolist()
@@ -60,14 +61,16 @@ def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None):
             "bg_inner": bg_inner,
             "bg_outer": bg_outer,
         }
+        if dumbbell is not None:
+            payload["dumbbell"] = {k: float(v) for k, v in dumbbell.items()}
 
     Path(path).write_text(json.dumps(payload, indent=2))
     return str(path)
 
 
 def load_mask(path):
-    """Read a saved placement -> {corners, radius, bg_inner, bg_outer} (missing fields
-    None). Accepts both the bare corners-list format and the full-mask dict format.
+    """Read a saved placement -> {corners, radius, bg_inner, bg_outer, dumbbell} (missing
+    fields None). Accepts both the bare corners-list format and the full-mask dict format.
 
     bg_inner is always the button radius: the background annulus starts at the button's
     edge, so it is never set by hand (any saved value is ignored)."""
@@ -75,10 +78,56 @@ def load_mask(path):
 
     data = json.loads(Path(path).read_text())
     if isinstance(data, dict):
-        mask = {k: data.get(k) for k in ("corners", "radius", "bg_inner", "bg_outer")}
+        mask = {k: data.get(k) for k in ("corners", "radius", "bg_inner", "bg_outer", "dumbbell")}
         mask["bg_inner"] = mask["radius"]
         return mask
-    return {"corners": data, "radius": None, "bg_inner": None, "bg_outer": None}
+    return {"corners": data, "radius": None, "bg_inner": None, "bg_outer": None, "dumbbell": None}
+
+
+# --------------------------------------------------------------------------- #
+# Dumbbells: a reaction chamber and its DNA chamber, joined by the neck
+# --------------------------------------------------------------------------- #
+
+# The shape's fields, in pixels: where the DNA chamber's center sits from the reaction
+# chamber's (dna_dx, dna_dy), the DNA chamber's radius, and the neck's width. The reaction
+# chamber's radius is the placement's `radius`.
+DUMBBELL_FIELDS = ("dna_dx", "dna_dy", "dna_radius", "neck_width")
+
+
+def dumbbell_mask(radius, dumbbell, margin=0.0):
+    """The dumbbell as a boolean stamp: a disc of `radius` (the reaction chamber) at the
+    origin, a disc of dumbbell["dna_radius"] at (dna_dx, dna_dy), and a strip
+    dumbbell["neck_width"] wide joining their centers; grown by `margin` px on every side
+    (for the background ring). Returns (mask, (x0, y0)): the stamp and the image offset of
+    its pixel (0, 0) from the reaction chamber's center (pixel units, the center at 0, 0)."""
+    from scipy import ndimage
+
+    dx, dy = float(dumbbell["dna_dx"]), float(dumbbell["dna_dy"])
+    r_dna, half_neck = float(dumbbell["dna_radius"]), float(dumbbell["neck_width"]) / 2.0
+    reach = max(radius, r_dna) + margin + 2
+    x0 = int(np.floor(min(0.0, dx) - reach))
+    y0 = int(np.floor(min(0.0, dy) - reach))
+    x1 = int(np.ceil(max(0.0, dx) + reach))
+    y1 = int(np.ceil(max(0.0, dy) + reach))
+    yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1].astype(float)
+    shape = (np.hypot(xx, yy) <= radius) | (np.hypot(xx - dx, yy - dy) <= r_dna)
+    length = np.hypot(dx, dy)
+    if length > 0:   # the neck: within half its width of the segment between the centers
+        t = np.clip((xx * dx + yy * dy) / length**2, 0.0, 1.0)
+        shape |= np.hypot(xx - t * dx, yy - t * dy) <= half_neck
+    if margin > 0:
+        shape = ndimage.distance_transform_edt(~shape) <= margin
+    return shape, (x0, y0)
+
+
+def dumbbell_outline(radius, dumbbell, margin=0.0):
+    """The dumbbell's outline, (n, 2) points (x, y) from the reaction chamber's center, for
+    drawing: the boundary of dumbbell_mask (grown by `margin`)."""
+    from skimage import measure
+
+    shape, (x0, y0) = dumbbell_mask(radius, dumbbell, margin)
+    contour = max(measure.find_contours(np.pad(shape, 1).astype(float), 0.5), key=len)
+    return np.column_stack([contour[:, 1] - 1 + x0, contour[:, 0] - 1 + y0])
 
 
 def load_corners(path):
@@ -133,6 +182,14 @@ def warped_grid(corners_path, warp_path, n_rows, n_cols):
     `corners_path` plus the local corrections in `warp_path` (none if it doesn't exist)."""
     cx, cy = bilinear_grid(load_mask(corners_path)["corners"], n_rows, n_cols)
     controls = load_warp(warp_path)
+    from ..analysis.steps import tally_step
+
+    name = Path(corners_path).stem.replace("_corners", "")
+    tally_step("warped_grid", "Place the grid",
+               ["4 corners placed manually (GridAdjuster);",
+                f"a bilinear {n_rows} × {n_cols} grid between them,",
+                "plus local corrections placed manually"],
+               name, label=f"`{name}`: {len(controls)} local corrections", unit="grids")
     if not controls:
         return cx, cy
     dx, dy = warp_offsets(controls, n_rows, n_cols)
@@ -291,3 +348,168 @@ def snap_to_spots(image, cx, cy, *, reach=50, spot_radius=22, min_snr=8,
             px, py = (wt * xx).sum() / wt.sum(), (wt * yy).sum() / wt.sum()
         sx[idx], sy[idx], snapped[idx] = x0 + px, y0 + py, True
     return sx, sy, snapped
+
+
+def center_on_spots(image, cx, cy, radius, *, reach=10, threshold_frac=0.3, min_snr=15,
+                    area_frac=(0.6, 1.6)):
+    """Move each grid point onto the center of its spot's shape, e.g. a labeled button in
+    the post-labeling Cy5 scan (MBO-052). `image` is the signal image, lightly smoothed;
+    `cx`, `cy` the grid; `radius` the button mask's radius (px).
+
+    For each point: the local background is the median of a ring outside the search area
+    (radius + reach/2 to radius + reach), the spot's height the window's 99th percentile above
+    it. The spot is the connected region above `threshold_frac` x that height which overlaps
+    the grid circle most, and its center is the region's unweighted centroid, so a bright rim
+    on one side doesn't pull the center (snap_to_spots, a weighted centroid, does). A point
+    moves only when the height is >= `min_snr` x the image noise (robust SD), the region
+    covers `area_frac` (min, max) x the circle's area (round, button-sized), and the move is
+    <= `reach` px. Points that don't move can take their neighbors' shift (shift_from_neighbors).
+
+    Returns (sx, sy, moved)."""
+    from scipy import ndimage
+
+    img = np.asarray(image, np.float32)
+    sub = img[::7, ::7]
+    noise = 1.4826 * np.median(np.abs(sub - np.median(sub)))
+    half = int(np.ceil(radius + reach)) + 2
+    yy, xx = np.mgrid[-half : half + 1, -half : half + 1]
+    rr = np.hypot(yy, xx)
+    window, ring = rr <= half, (rr > radius + reach / 2) & (rr <= half)
+    circle_area = np.pi * radius**2
+    sx, sy = np.array(cx, float), np.array(cy, float)
+    moved = np.zeros(sx.shape, bool)
+    for idx in np.ndindex(sx.shape):
+        x0, y0 = int(round(sx[idx])), int(round(sy[idx]))
+        w = img[y0 - half : y0 + half + 1, x0 - half : x0 + half + 1]
+        if w.shape != window.shape:
+            continue  # too close to the image edge
+        local = np.median(w[ring])
+        height = np.percentile(w[window], 99) - local
+        if height < min_snr * noise:
+            continue
+        labels, _ = ndimage.label((w - local > threshold_frac * height) & window)
+        in_circle = np.hypot(xx - (sx[idx] - x0), yy - (sy[idx] - y0)) <= radius
+        counts = np.bincount(labels[in_circle & (labels > 0)])
+        if counts.size < 2:
+            continue
+        region = labels == np.argmax(counts)
+        if not area_frac[0] * circle_area <= region.sum() <= area_frac[1] * circle_area:
+            continue
+        px, py = xx[region].mean(), yy[region].mean()
+        if np.hypot(x0 + px - sx[idx], y0 + py - sy[idx]) > reach:
+            continue
+        sx[idx], sy[idx], moved[idx] = x0 + px, y0 + py, True
+    return sx, sy, moved
+
+
+def _ring_kernels(radius, width=1.5):
+    """Kernels that, correlated with an image's x and y gradients, sum the gradient pointing
+    toward the center along a ring of `radius` px (high for a bright disc on a dark field)."""
+    h = int(np.ceil(radius + 3 * width))
+    yy, xx = np.mgrid[-h : h + 1, -h : h + 1].astype(float)
+    rr = np.hypot(xx, yy)
+    ring = np.exp(-0.5 * ((rr - radius) / width) ** 2)
+    ring /= ring.sum()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ux, uy = np.nan_to_num(xx / rr), np.nan_to_num(yy / rr)
+    return -ring * ux, -ring * uy
+
+
+def center_on_discs(image, cx, cy, radius, *, reach=12, smooth=2.0, min_contrast=1.8,
+                    inner=(22, 33), outer=(42, 50)):
+    """Move each grid point onto the center of the bright disc around it, e.g. a reaction
+    chamber filled with dye in the last SNAP-labeling frame (MBO-052). `cx`, `cy` the grid;
+    `radius` the disc's radius (px).
+
+    A ring Hough transform at a known radius: within `reach` px of each point, the offset
+    whose ring collects the most edge pointing toward its center (the image smoothed by
+    `smooth` px), refined to a sub-pixel peak. Flow channels and necks break only short arcs
+    of the edge, so they barely move the peak. A fit counts when the disc stands out, its
+    median between `inner` radii >= `min_contrast` x the median between `outer` radii (the
+    field outside), and the peak is not at the edge of the search; points that fail stay put
+    and can take their neighbors' shift (shift_from_neighbors).
+
+    Returns (sx, sy, fitted, contrast)."""
+    from scipy import ndimage, signal
+
+    img = ndimage.gaussian_filter(np.asarray(image, np.float32), smooth)
+    gy, gx = np.gradient(img)
+    kx, ky = _ring_kernels(radius)
+    pad = kx.shape[0] // 2 + reach + 2
+    sy_, sx_ = np.mgrid[-reach : reach + 1, -reach : reach + 1]
+    in_reach = np.hypot(sx_, sy_) <= reach
+    m = int(np.ceil(outer[1])) + 1
+    yy, xx = np.mgrid[-m : m + 1, -m : m + 1]
+    rr = np.hypot(xx, yy)
+    inner_m, outer_m = (rr >= inner[0]) & (rr <= inner[1]), (rr >= outer[0]) & (rr <= outer[1])
+
+    def vertex(a, b, c):  # sub-pixel peak of a parabola through three points
+        den = a - 2 * b + c
+        return 0.0 if den == 0 or not np.isfinite(den) else float(np.clip(0.5 * (a - c) / den, -0.5, 0.5))
+
+    sx, sy = np.array(cx, float), np.array(cy, float)
+    fitted = np.zeros(sx.shape, bool)
+    contrast = np.full(sx.shape, np.nan)
+    for idx in np.ndindex(sx.shape):
+        x0, y0 = int(round(sx[idx])), int(round(sy[idx]))
+        if min(y0, x0) - pad < 0 or y0 + pad >= img.shape[0] or x0 + pad >= img.shape[1]:
+            continue  # too close to the image edge
+        ys, xs = slice(y0 - pad, y0 + pad + 1), slice(x0 - pad, x0 + pad + 1)
+        score = (signal.correlate(gx[ys, xs], kx, mode="same", method="fft")
+                 + signal.correlate(gy[ys, xs], ky, mode="same", method="fft"))
+        win = np.where(in_reach, score[pad - reach : pad + reach + 1, pad - reach : pad + reach + 1], -np.inf)
+        py, px = np.unravel_index(np.argmax(win), win.shape)
+        if not (0 < py < win.shape[0] - 1 and 0 < px < win.shape[1] - 1) or not (
+                np.isfinite(win[py - 1, px]) and np.isfinite(win[py + 1, px])
+                and np.isfinite(win[py, px - 1]) and np.isfinite(win[py, px + 1])):
+            continue  # the peak is at the edge of the search
+        nx = x0 + px - reach + vertex(win[py, px - 1], win[py, px], win[py, px + 1])
+        ny = y0 + py - reach + vertex(win[py - 1, px], win[py, px], win[py + 1, px])
+        w = img[int(round(ny)) - m : int(round(ny)) + m + 1, int(round(nx)) - m : int(round(nx)) + m + 1]
+        if w.shape != rr.shape:
+            continue
+        contrast[idx] = np.median(w[inner_m]) / max(float(np.median(w[outer_m])), 1e-6)
+        if contrast[idx] >= min_contrast:
+            sx[idx], sy[idx], fitted[idx] = nx, ny, True
+    return sx, sy, fitted, contrast
+
+
+def shift_from_neighbors(cx, cy, sx, sy, moved, *, span=2, min_neighbors=3):
+    """Give each point that didn't move (`moved` False) the median shift of the points that
+    did within `span` rows and columns, when it has >= `min_neighbors` of them: a grid's
+    placement error changes slowly across the chip, so a dim chamber follows its neighbors.
+
+    Returns (fx, fy, filled): the centers and which points took their neighbors' shift."""
+    cx, cy = np.asarray(cx, float), np.asarray(cy, float)
+    dx, dy = np.asarray(sx, float) - cx, np.asarray(sy, float) - cy
+    fx, fy = np.array(sx, float), np.array(sy, float)
+    filled = np.zeros(cx.shape, bool)
+    for r, c in np.ndindex(cx.shape):
+        if moved[r, c]:
+            continue
+        rs, cs = slice(max(r - span, 0), r + span + 1), slice(max(c - span, 0), c + span + 1)
+        near = moved[rs, cs]
+        if near.sum() >= min_neighbors:
+            fx[r, c] = cx[r, c] + np.median(dx[rs, cs][near])
+            fy[r, c] = cy[r, c] + np.median(dy[rs, cs][near])
+            filled[r, c] = True
+    return fx, fy, filled
+
+
+def save_centers(path, cx, cy, source):
+    """Write centers (n_rows x n_cols) to a CSV: mark_row, mark_col, x, y, and `source`, an
+    array of the same shape naming how each was set (e.g. "fit", "neighbors", "grid")."""
+    import pandas as pd
+
+    r, c = np.indices(np.shape(cx))
+    pd.DataFrame({"mark_row": r.ravel(), "mark_col": c.ravel(), "x": np.ravel(cx), "y": np.ravel(cy),
+                  "source": np.ravel(source)}).to_csv(path, index=False)
+
+
+def load_centers(path):
+    """(cx, cy), each n_rows x n_cols, from a save_centers CSV."""
+    import pandas as pd
+
+    t = pd.read_csv(path).sort_values(["mark_row", "mark_col"])
+    shape = (t["mark_row"].max() + 1, t["mark_col"].max() + 1)
+    return t["x"].to_numpy().reshape(shape), t["y"].to_numpy().reshape(shape)

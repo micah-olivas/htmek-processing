@@ -11,10 +11,51 @@ import matplotlib.pyplot as plt
 
 from .layout import chamber_tags
 from .io import time_coord
-from .grid import WARP_REACH, bilinear_grid, load_mask, load_warp, save_corners, save_warp, warp_offsets
+from .grid import (DUMBBELL_FIELDS, WARP_REACH, bilinear_grid, dumbbell_outline, load_mask, load_warp,
+                   save_corners, save_warp, warp_offsets)
+
+# dumbbell mode: the background ring's outer edge, this many px beyond the outline
+DUMBBELL_BG_MARGIN = 10
 from .quantify import centers_to_df, kinetic_traces
 
 CTRL_COLOR = "#FF4FD8"  # local corrections (magenta: apart from the cyan corners and yellow ROIs)
+
+# The window's colors, light and dark (the image itself is always gray on black). `rc` is
+# applied while the window and its sliders are built; the rest colors the "How to use" panel.
+THEMES = {
+    "light": dict(rc={}, panel="#F5F7FA", panel_edge="0.75", key="white", key_edge="0.35",
+                  line="0.3", rule="0.8", text="black", note="0.4"),
+    "dark": dict(rc={"figure.facecolor": "#1E1E1E", "axes.facecolor": "#2A2A2A", "axes.edgecolor": "0.6",
+                     "text.color": "0.9", "axes.labelcolor": "0.9", "xtick.color": "0.8",
+                     "ytick.color": "0.8"},
+                 panel="#2A2D31", panel_edge="0.4", key="#3A3D42", key_edge="0.65",
+                 line="0.75", rule="0.4", text="0.92", note="0.65"),
+}
+
+
+def os_dark_mode():
+    """Whether the OS is set to a dark appearance: macOS (AppleInterfaceStyle), Windows
+    (AppsUseLightTheme), GNOME (color-scheme). False when it can't tell."""
+    import platform
+    import subprocess
+
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            out = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                                 capture_output=True, text=True, timeout=2)
+            return out.stdout.strip().lower() == "dark"
+        if system == "Windows":
+            import winreg
+
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                             capture_output=True, text=True, timeout=2)
+        return "dark" in out.stdout.lower()
+    except Exception:   # no such setting, no gsettings, ...: light
+        return False
 
 # the on-screen key: mouse actions (button, marker, color, size, what) and hotkeys (keys, what)
 KEY_MOUSE = [
@@ -25,7 +66,7 @@ KEY_MOUSE = [
 KEY_KEYS = [
     ("z", "zoom box (one zoom, then back to dragging)"),
     ("+ −", "zoom in / out where the mouse is"),
-    ("2 fingers", "pan (trackpad scroll)"),
+    ("2-finger", "scroll to pan (trackpad)"),
     ("h 0", "home: the whole chip"),
     ("p", "pan (press again to stop)"),
     ("esc", "leave zoom / pan"),
@@ -57,12 +98,25 @@ class GridAdjuster:
     Frames are read only when shown, so a lazy zarr/xarray stack is never loaded whole.
     `to_kinetic_df()` uses the stack.
 
+    With `dumbbell` = {dna_dx, dna_dy, dna_radius, neck_width} (px; grid.DUMBBELL_FIELDS),
+    each grid point is a dumbbell instead of a circle: the reaction chamber (of `radius`, at
+    the grid point), its DNA chamber at (dna_dx, dna_dy) from it, and the neck between them,
+    with sliders for each and `bg_outer` as the background ring's margin beyond the outline.
+    The shape is saved with the corners (and wins over `dumbbell=` once saved); read it with
+    quantify.dumbbell_timecourse.
+
+    The window follows the OS's light or dark appearance (os_dark_mode); `dark=True` or
+    `dark=False` overrides it.
+
     A "How to use" panel left of the image lists the mouse actions and the hotkeys
     (KEY_KEYS): z zoom box, + / − zoom where the mouse is, two-finger scroll pans, h or 0 home, p pan, esc leave
     zoom / pan, 1-4 the corners. It refits when the window is resized."""
 
     LABELS = ("TL", "TR", "BR", "BL")
-    MAX_DISPLAY_PX = 1024  # longest image edge drawn at once (see _render_view)
+    MAX_DISPLAY_PX = 1024  # longest edge of the VIEW drawn at once (see _render_view)
+    RENDER_MARGIN = 0.5    # the image drawn reaches this fraction of the view past each side
+    OUTLINE_POINTS = 64    # points per drawn dumbbell outline (1,792 x 2 outlines on a chip)
+    PAN_SETTLE_MS = 150    # after the last scroll, wait this long before the full redraw (_pan_px)
     DRAG_FPS = 30          # at most this many redraws per second while dragging
     PANEL_RIGHT = 0.27     # figure fraction: the key panel ends here; image and sliders start right of it
 
@@ -82,7 +136,11 @@ class GridAdjuster:
         pick_radius=None,
         frame=0,
         warp_path=None,
+        dark=None,
+        dumbbell=None,
     ):
+        # the window's theme: the OS's appearance unless `dark` is given
+        self.theme = THEMES["dark" if (os_dark_mode() if dark is None else dark) else "light"]
         # A (time, y, x) stack stays lazy: only the frame on screen is read
         a = img.squeeze() if hasattr(img, "isel") else np.asarray(img).squeeze()
         self.stack = a if a.ndim == 3 else None
@@ -118,11 +176,16 @@ class GridAdjuster:
         )
         self.radius = saved.get("radius") if saved.get("radius") is not None else radius
         self.bg_inner = self.radius  # the annulus starts at the button edge
+        # dumbbell mode: each grid point is a reaction chamber joined to its DNA chamber
+        # (grid.dumbbell_mask); the saved shape wins, `dumbbell=` seeds a first run
+        self.dumbbell = saved.get("dumbbell") or ({k: float(dumbbell[k]) for k in DUMBBELL_FIELDS}
+                                                   if dumbbell is not None else None)
         self.bg_outer = (
             saved.get("bg_outer")
             if saved.get("bg_outer") is not None
             else bg_outer
             if bg_outer is not None
+            else DUMBBELL_BG_MARGIN if self.dumbbell is not None
             else self.radius + 11
         )
 
@@ -141,7 +204,8 @@ class GridAdjuster:
 
         self.corners = np.asarray(corners, float)
         self._drag = None
-        self._build(vmin_pct, vmax_pct, figsize)
+        with plt.rc_context(self.theme["rc"]):
+            self._build(vmin_pct, vmax_pct, figsize)
         # saved as soon as the window opens (and after every change), so a later cell always
         # finds the placement, even when only local corrections were made
         self._persist()
@@ -226,14 +290,15 @@ class GridAdjuster:
         return df
 
     def save_corners(self, path=None):
-        """Save the full mask (corners + radius + annulus) to JSON so the next GridAdjuster
-        with the same corners_path resumes exactly where you left off."""
+        """Save the full mask (corners + radius + annulus, and the dumbbell's shape) to JSON so
+        the next GridAdjuster with the same corners_path resumes exactly where you left off."""
         return save_corners(
             path or self.corners_path,
             self.corners,
             radius=self.radius,
             bg_inner=self.bg_inner,
             bg_outer=self.bg_outer,
+            dumbbell=self.dumbbell,
         )
 
     def _build(self, vmin_pct, vmax_pct, figsize):
@@ -275,6 +340,7 @@ class GridAdjuster:
         # re-render on zoom/pan; autoscale off so swapping the image never moves the view
         self.ax.set_autoscale_on(False)
         self._view_key = None
+        self._fast, self._pan_timer, self._pan_region = False, None, None   # see _pan_px
         self.ax.callbacks.connect("xlim_changed", self._render_view)
         self.ax.callbacks.connect("ylim_changed", self._render_view)
 
@@ -303,9 +369,19 @@ class GridAdjuster:
             self.ax.add_collection(coll)
             return coll
 
-        self._roi = rings(self.radius, "yellow", 0.8)
-        self._bg_in = rings(self.bg_inner, "orange", 0.6, ":")
-        self._bg_out = rings(self.bg_outer, "orange", 0.6, ":")
+        if self.dumbbell is not None:
+            # one Line2D per outline type, every dumbbell's outline in it (NaN between them):
+            # a single artist, like the ring collections, so a drag stays fast
+            from matplotlib.lines import Line2D
+
+            self._roi = self.ax.add_line(Line2D([], [], color="yellow", lw=0.8))
+            self._bg_in = self.ax.add_line(Line2D([], [], visible=False))   # the ring starts at the outline
+            self._bg_out = self.ax.add_line(Line2D([], [], color="orange", lw=0.6, ls=":"))
+            self._dumbbell_templates()
+        else:
+            self._roi = rings(self.radius, "yellow", 0.8)
+            self._bg_in = rings(self.bg_inner, "orange", 0.6, ":")
+            self._bg_out = rings(self.bg_outer, "orange", 0.6, ":")
         (self._grid_pts,) = self.ax.plot(cx.ravel(), cy.ravel(), "r.", ms=3)
 
         # "col,row" labels beside each ROI -- only on small chips, where they stay legible
@@ -405,32 +481,68 @@ class GridAdjuster:
         # the "How to use" panel left of the image (refit on resize), the sliders right of it
         self.fig.subplots_adjust(left=self.PANEL_RIGHT + 0.06)
         x0 = self.PANEL_RIGHT + 0.14  # room for the slider labels ("bg outer") left of the bars
+        right = 0.9 if self.dumbbell is None else 0.58   # dumbbell mode: a second column of sliders
         for s in (getattr(self, "_frame_slider", None), self._vmin_slider, self._vmax_slider,
                   self._radius_slider, self._bg_outer_slider):
             if s is not None:
                 b = s.ax.get_position()
-                s.ax.set_position([x0, b.y0, 0.9 - x0, b.height])
+                s.ax.set_position([x0, b.y0, right - x0, b.height])
+        self._dumbbell_sliders = []
+        if self.dumbbell is not None:
+            # where the DNA chamber sits from the reaction chamber, its radius, the neck's width
+            specs = (("dna_dx", "DNA dx", -400, 400, 0.23), ("dna_dy", "DNA dy", -200, 200, 0.19),
+                     ("dna_radius", "DNA r", 2, 150, 0.12), ("neck_width", "neck", 1, 150, 0.075))
+            for key, label, lo, hi, y in specs:
+                slider = Slider(self.fig.add_axes([0.70, y, 0.2, 0.02]), label, lo, hi,
+                                valinit=self.dumbbell[key], valstep=1)
+                slider.on_changed(lambda val, key=key: self._on_dumbbell(key, val))
+                self._dumbbell_sliders.append(slider)
+            self._bg_outer_slider.label.set_text("bg margin")
+            self._radius_slider.label.set_text("chamber r")
         self._key_ax = None
         self._draw_key()
         self.fig.canvas.mpl_connect("resize_event", lambda e: self._draw_key())
+        for s in (getattr(self, "_frame_slider", None), self._vmin_slider, self._vmax_slider,
+                  self._radius_slider, self._bg_outer_slider, *self._dumbbell_sliders):
+            if s is not None:   # slider labels and values follow the theme's text color
+                s.label.set_color(self.theme["text"])
+                s.valtext.set_color(self.theme["text"])
+        for label in self._mask_check.labels:
+            label.set_color(self.theme["text"])
+        if hasattr(self._mask_check, "set_frame_props"):   # matplotlib >= 3.7: the box follows the theme
+            self._mask_check.set_frame_props({"edgecolor": self.theme["text"]})
+            self._mask_check.set_check_props({"facecolor": self.theme["text"]})
         self._update_artists()
 
     def _render_view(self, ax=None):
-        """Show the visible region at the finest stride that keeps it <= MAX_DISPLAY_PX,
+        """Show the visible region at the finest stride that keeps it within the axes' screen pixels,
         so zooming in reveals full-resolution pixels without ever drawing the whole
         mosaic at full resolution."""
         H, W = self.img.shape
         (xa, xb), (ya, yb) = sorted(self.ax.get_xlim()), sorted(self.ax.get_ylim())
-        x0, x1 = max(0, int(xa)), min(W, int(np.ceil(xb)) + 1)
-        y0, y1 = max(0, int(ya)), min(H, int(np.ceil(yb)) + 1)
-        if x1 <= x0 or y1 <= y0:
+        if min(xb, W) <= max(xa, 0) or min(yb, H) <= max(ya, 0):
             return
 
-        step = max(1, int(np.ceil(max(x1 - x0, y1 - y0) / self.MAX_DISPLAY_PX)))
-        key = (x0, x1, y0, y1, step)
-        if key == self._view_key:  # x- and y-limit callbacks both fire on one zoom
-            return
-        self._view_key = key
+        # The stride keeps the view at no more image pixels than the axes have screen pixels:
+        # matplotlib resamples every pixel it is given on each draw, and shrinking an image
+        # larger than the screen is what makes drawing slow (MBO-052, a Retina screen: 73 ms
+        # per draw at 1.7x the screen's pixels, 15 ms at or below them, 2026-10-30). Zoomed in
+        # until the view fits the screen, it is full resolution.
+        # The region drawn is the view plus RENDER_MARGIN of it on every side, so a pan within
+        # it only moves the axes (no new image); the image is redrawn when the view leaves
+        # that region or the stride changes (a zoom).
+        screen_px = max(1.0, self.ax.bbox.width, self.ax.bbox.height)
+        step = max(1, int(np.ceil(max(xb - xa, yb - ya) / screen_px)))
+        if self._view_key is not None:
+            kx0, kx1, ky0, ky1, kstep = self._view_key
+            inside = (xa >= kx0 or kx0 == 0) and (xb <= kx1 or kx1 == W) and \
+                     (ya >= ky0 or ky0 == 0) and (yb <= ky1 or ky1 == H)
+            if kstep == step and inside:
+                return
+        mx, my = self.RENDER_MARGIN * (xb - xa), self.RENDER_MARGIN * (yb - ya)
+        x0, x1 = max(0, int(xa - mx)), min(W, int(np.ceil(xb + mx)) + 1)
+        y0, y1 = max(0, int(ya - my)), min(H, int(np.ceil(yb + my)) + 1)
+        self._view_key = (x0, x1, y0, y1, step)
 
         shown = self.img[y0:y1:step, x0:x1:step]
         self._im.set_data(shown)
@@ -442,7 +554,8 @@ class GridAdjuster:
                 y0 - 0.5,
             )
         )
-        self.fig.canvas.draw_idle()
+        if not self._fast:   # mid-pan, the pan draws the image itself (_pan_px)
+            self.fig.canvas.draw_idle()
 
     def _on_key(self, e):
         """z: one zoom box; + / −: zoom on the view's center; h or 0: the whole chip;
@@ -503,12 +616,56 @@ class GridAdjuster:
         self.fig.canvas.draw_idle()
 
     def _pan_px(self, dx_px, dy_px):
-        """Pan the view by a scroll of (dx_px, dy_px) screen pixels: the image follows the fingers."""
+        """Pan the view by a scroll of (dx_px, dy_px) screen points: the image follows the fingers.
+
+        Redrawing the window costs ~100-150 ms on a Retina screen (the image's resampling, the
+        key panel, sliders, 1,792 x 3 rings), too slow to follow a trackpad. So while
+        scrolling, what is already on screen is moved: the axes' last drawn pixels are cached
+        once and put back shifted by the scroll (canvas.restore_region with an offset, well
+        under a millisecond), the uncovered strip left in the axes' background color; the view
+        limits move with it. PAN_SETTLE_MS after the last scroll, the window is redrawn
+        properly (the new strip, the ticks, the image at its stride)."""
+        canvas = self.fig.canvas
         (x0, x1), (y1, y0) = self.ax.get_xlim(), self.ax.get_ylim()
         bbox = self.ax.get_window_extent()
-        ppx = (x1 - x0) / max(bbox.width, 1)   # data units per screen pixel
+        ratio = getattr(canvas, "device_pixel_ratio", 1) or 1   # screen points -> device pixels
+        ppx = (x1 - x0) / max(bbox.width, 1)   # data units per device pixel
         ppy = (y1 - y0) / max(bbox.height, 1)
-        self._set_view((x0 + x1) / 2 - dx_px * ppx, (y0 + y1) / 2 - dy_px * ppy, (x1 - x0) / 2, (y1 - y0) / 2)
+        H, W = self.img.shape
+        hw, hh = (x1 - x0) / 2, (y1 - y0) / 2
+        xc = min(max((x0 + x1) / 2 - dx_px * ratio * ppx, hw - 0.5), W - 0.5 - hw)
+        yc = min(max((y0 + y1) / 2 - dy_px * ratio * ppy, hh - 0.5), H - 0.5 - hh)
+        if not getattr(canvas, "supports_blit", False):
+            self._set_view(xc, yc, hw, hh)
+            return
+        if not self._fast:   # cache what is on screen now
+            self._fast = True
+            self._pan_region = canvas.copy_from_bbox(self.ax.bbox)
+            self._pan_shift = [0.0, 0.0]
+            if self._pan_timer is None:
+                self._pan_timer = canvas.new_timer(interval=self.PAN_SETTLE_MS)
+                self._pan_timer.single_shot = True
+                self._pan_timer.add_callback(self._end_fast_pan)
+        # the content moves opposite to the view: right / down on screen, in device pixels
+        self._pan_shift[0] += ((x0 + x1) / 2 - xc) / ppx
+        self._pan_shift[1] += ((y0 + y1) / 2 - yc) / ppy
+        self.ax.set_xlim(xc - hw, xc + hw)
+        self.ax.set_ylim(yc + hh, yc - hh)
+        sx, sd = (int(round(v)) for v in self._pan_shift)
+        rx1, ry1, rx2, ry2 = self._pan_region.get_extents()   # buffer pixels, y down
+        self.ax.draw_artist(self.ax.patch)                     # the uncovered strip: background
+        canvas.restore_region(self._pan_region,
+                              bbox=(rx1 + max(0, -sx), ry1 + max(0, -sd), rx2 - max(0, sx), ry2 - max(0, sd)),
+                              xy=(rx1 + sx, ry1 + sd))
+        canvas.blit(self.ax.bbox)
+        self._pan_timer.stop()
+        self._pan_timer.start()
+
+    def _end_fast_pan(self):
+        """The scrolling has stopped: redraw the window at the new view."""
+        self._fast = False
+        self._pan_region = None
+        self.fig.canvas.draw_idle()
 
     def _connect_scroll_pan(self):
         """Two-finger (trackpad) scrolling pans the view. In a Qt window the raw scroll is read
@@ -532,7 +689,9 @@ class GridAdjuster:
                         dx, dy = a.x() / 3, a.y() / 3
                     else:
                         dx, dy = d.x(), d.y()
-                    adjuster._pan_px(dx, -dy)   # screen y grows down; the image's rows too
+                    # Qt's deltas are already in the content's direction (positive y: the
+                    # content moves down the screen), as the image's rows grow down too
+                    adjuster._pan_px(dx, dy)
                     return True
 
             self._scroll_filter = _ScrollPan()
@@ -595,46 +754,52 @@ class GridAdjuster:
         ax.set_xlim(0, width)
         ax.set_ylim(height, 0)  # unscaled inches from the panel's top
         ax.axis("off")
+        th = self.theme
         ax.add_patch(FancyBboxPatch((0.02, 0.02), width - 0.04, height - 0.04,
-                                    boxstyle="round,pad=0,rounding_size=0.12", fc="#F5F7FA", ec="0.75", lw=0.8))
-        ax.text(icon_x, pad + 0.12, "How to use", fontsize=fs(12), weight="bold", va="center")
+                                    boxstyle="round,pad=0,rounding_size=0.12", fc=th["panel"], ec=th["panel_edge"],
+                                    lw=0.8))
+        ax.text(icon_x, pad + 0.12, "How to use", fontsize=fs(12), weight="bold", va="center", color=th["text"])
 
         def mouse(y, which):
             """A small mouse, its left or right button shaded."""
             w, h = 0.26, 0.34
             ax.add_patch(FancyBboxPatch((icon_x, y - h / 2), w, h, boxstyle="round,pad=0,rounding_size=0.09",
-                                        fc="white", ec="0.3", lw=0.9))
+                                        fc=th["key"], ec=th["line"], lw=0.9))
             bx = icon_x if which == "left" else icon_x + w / 2
             ax.add_patch(FancyBboxPatch((bx + 0.025, y - h / 2 + 0.025), w / 2 - 0.05, h / 2 - 0.05,
                                         boxstyle="round,pad=0,rounding_size=0.03", fc="#4A90D9", ec="none"))
-            ax.plot([icon_x + w / 2] * 2, [y - h / 2, y], color="0.3", lw=0.8)
-            ax.plot([icon_x, icon_x + w], [y, y], color="0.3", lw=0.8)
+            ax.plot([icon_x + w / 2] * 2, [y - h / 2, y], color=th["line"], lw=0.8)
+            ax.plot([icon_x, icon_x + w], [y, y], color=th["line"], lw=0.8)
 
         def keycap(x, y, k):
             w = 0.16 + 0.07 * len(k)
             ax.add_patch(FancyBboxPatch((x, y - 0.12), w, 0.24, boxstyle="round,pad=0,rounding_size=0.04",
-                                        fc="white", ec="0.35", lw=0.9))
-            ax.text(x + w / 2, y, k, fontsize=fs(9), weight="bold", ha="center", va="center", family="monospace")
+                                        fc=th["key"], ec=th["key_edge"], lw=0.9))
+            ax.text(x + w / 2, y, k, fontsize=fs(9), weight="bold", ha="center", va="center", family="monospace",
+                    color=th["text"])
             return x + w + 0.06
 
         y = pad + 0.35
         for (kind, item), h in zip(rows, heights):
             yc = y + h / 2
             if kind == "rule":
-                ax.plot([icon_x, width - icon_x], [yc, yc], color="0.8", lw=0.8)
+                ax.plot([icon_x, width - icon_x], [yc, yc], color=th["rule"], lw=0.8)
             else:
                 if kind == "mouse":
                     which, marker, color, ms, text = item
                     mouse(yc, which)
                     ax.plot([icon_x + 0.5], [yc], marker, ms=ms * scale, mfc="none", mec=color, mew=1.8)
+                    x = text_x
                 else:
                     keys, text = item
                     x = icon_x
                     for k in keys.split():
                         x = keycap(x, yc, k)
-                ax.text(text_x, yc, textwrap.fill(text, wrap), fontsize=fs(9.5), va="center", linespacing=1.25)
+                    x = max(text_x, x + 0.04)   # the text starts after the keys, never under them
+                ax.text(x, yc, textwrap.fill(text, wrap), fontsize=fs(9.5), va="center", linespacing=1.25,
+                        color=th["text"])
             y += h
-        ax.text(icon_x, y + 0.12, note, fontsize=fs(8.5), color="0.4", va="top", linespacing=1.3)
+        ax.text(icon_x, y + 0.12, note, fontsize=fs(8.5), color=th["note"], va="top", linespacing=1.3)
         self._key_ax = ax
 
     def _persist(self):
@@ -674,16 +839,49 @@ class GridAdjuster:
 
     def _on_radius(self, val):
         self.radius = self.bg_inner = int(val)  # the annulus starts at the button edge
-        self._set_diameter(self._roi, self.radius)
-        self._set_diameter(self._bg_in, self.bg_inner)
+        if self.dumbbell is not None:
+            self._dumbbell_templates()
+            self._update_artists()
+        else:
+            self._set_diameter(self._roi, self.radius)
+            self._set_diameter(self._bg_in, self.bg_inner)
         self._persist()
         self.fig.canvas.draw_idle()
 
     def _on_bg_outer(self, val):
         self.bg_outer = int(val)
-        self._set_diameter(self._bg_out, self.bg_outer)
+        if self.dumbbell is not None:   # the margin of the background ring beyond the outline
+            self._dumbbell_templates()
+            self._update_artists()
+        else:
+            self._set_diameter(self._bg_out, self.bg_outer)
         self._persist()
         self.fig.canvas.draw_idle()
+
+    def _on_dumbbell(self, key, val):
+        self.dumbbell[key] = float(val)
+        self._dumbbell_templates()
+        self._update_artists()
+        self._persist()
+        self.fig.canvas.draw_idle()
+
+    def _dumbbell_templates(self):
+        """The dumbbell's outline and its background ring's outer edge, relative to the
+        reaction chamber's center, thinned to OUTLINE_POINTS each."""
+        def thin(outline):
+            keep = np.linspace(0, len(outline) - 1, self.OUTLINE_POINTS).astype(int)
+            return outline[keep]
+
+        self._db_outline = thin(dumbbell_outline(self.radius, self.dumbbell))
+        self._db_bg = thin(dumbbell_outline(self.radius, self.dumbbell, margin=self.bg_outer))
+
+    @staticmethod
+    def _place(template, pts):
+        """Every chamber's copy of an outline, as one (x, y) line with NaN between copies."""
+        xs = pts[:, :1] + template[None, :, 0]
+        ys = pts[:, 1:] + template[None, :, 1]
+        gap = np.full((len(pts), 1), np.nan)
+        return np.hstack([xs, gap]).ravel(), np.hstack([ys, gap]).ravel()
 
     def _nearest(self, x, y):
         d = np.hypot(self.corners[:, 0] - x, self.corners[:, 1] - y)
@@ -803,8 +1001,12 @@ class GridAdjuster:
         pts = np.column_stack([cx.ravel(), cy.ravel()])
         self._grid_pts.set_data(cx.ravel(), cy.ravel())
 
-        for coll in (self._roi, self._bg_in, self._bg_out):
-            coll.set_offsets(pts)  # one array update per ring type
+        if self.dumbbell is not None:
+            self._roi.set_data(*self._place(self._db_outline, pts))
+            self._bg_out.set_data(*self._place(self._db_bg, pts))
+        else:
+            for coll in (self._roi, self._bg_in, self._bg_out):
+                coll.set_offsets(pts)  # one array update per ring type
         for lab, p in zip(self._index_labels, pts):  # index labels track their buttons
             lab.xy = p
 

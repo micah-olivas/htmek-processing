@@ -111,8 +111,13 @@ def centers_to_df(
     bg_outer=None,
     bg_agg="median",
     prefix=None,
+    name=None,
 ):
     """Tidy DataFrame from explicit centers, one row per chamber.
+
+    `name` (e.g. the scan's label) records the readout as a step of the pipeline's record
+    (analysis.steps, for the report's flowchart), one item per name; without it nothing is
+    recorded (the per-frame calls inside kinetic_traces, the grid adjuster).
 
     Columns: mark_row, mark_col, tag, x, y, one column per entry in `aggs`, and n_px.
     With `bg=True` (or explicit bg_inner/bg_outer) it also adds the local background 'bg'
@@ -162,7 +167,21 @@ def centers_to_df(
         float(radius),
     )  # lists: pd.concat-safe
     df.attrs["bg_annulus"] = (bi, bo)
+    if name is not None:
+        _tally_readout(f"centers_to_df_{prefix or 'roi'}", f"Read per {(prefix or 'ROI').replace('_', ' ')}",
+                       radius, (bi, bo) if bi is not None else None, aggs, name, nr * nc)
     return _with_prefix(df, prefix, aggs, bg_agg)
+
+
+def _tally_readout(step, title, radius, ring, aggs, name, n_chambers, frames=None):
+    """Record one image (or run) read per chamber under the readout step `step`."""
+    from ..analysis.steps import tally_step
+
+    rule = [f"{', '.join(aggs)} in a {radius:g} px circle per chamber"]
+    if ring is not None:
+        rule.append(f"local background: median of a {ring[0]:g}–{ring[1]:g} px ring")
+    rule.append(f"{n_chambers:,} chambers" + (", every pass" if frames else ""))
+    tally_step(step, title, rule, name, unit="runs" if frames else "images")
 
 
 def _with_prefix(df, prefix, aggs, bg_agg="median"):
@@ -430,7 +449,7 @@ def fit_bleaching(traces, value="median", *, ref_tags=("BLANK",), by="frame",
 
 
 def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=None,
-                       aggs=("median", "mean", "sum"), prefix=None):
+                       aggs=("median", "mean", "sum"), prefix=None, name=None):
     """Per-timepoint intensities of every chamber of a kinetic run, the standard readout:
     one row per chamber x frame with `seconds` (the time of the tile the chamber's center
     falls in, since the run started: chambers in one pass are imaged up to a pass apart),
@@ -442,7 +461,8 @@ def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=N
     and would cancel the signal. `tiled` is the raw acquisition (its per-tile 'seconds'),
     `tile_px` the stitched tile pitch (the store's attrs['tile_px']). `prefix` names the
     columns by mask, as centers_to_df's (e.g. "chamber_ROI": `chamber_ROI_median`,
-    `chamber_ROI_median_minus_frame0`)."""
+    `chamber_ROI_median_minus_frame0`). `name` (e.g. the run) records the readout as a
+    step of the pipeline's record (analysis.steps), one item per name."""
     from .stitch import chamber_seconds
 
     seconds = chamber_seconds(tiled["seconds"].values, cx, cy, tile_px)
@@ -455,4 +475,133 @@ def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=N
     for a in aggs:
         col = f"{prefix}_{a}" if prefix else a
         df[f"{col}_minus_frame0"] = df[col].to_numpy() - idx.map(first[col]).to_numpy()
+    if name is not None:
+        _tally_readout(f"chamber_timecourse_{prefix or 'roi'}", "Read every pass per chamber", radius, ring,
+                       aggs, name, len(first), frames=True)
     return df
+
+
+def dumbbell_intensities(image, cx, cy, columns, *, radius, dumbbell, ring=(2.0, 10.0), prefix="dumbbell"):
+    """One image's intensity over each chamber's dumbbell (grid.dumbbell_mask: the reaction
+    chamber, of `radius`, its DNA chamber and the neck between them), one row per chamber:
+    mark_row, mark_col, tag, x, y (the reaction chamber's center), and <prefix>_sum, _mean,
+    _n_px over the dumbbell; with `ring` = (gap, outer) px, the median of a ring around the
+    outline from `gap` to `outer` px out (<prefix>_bg) and <prefix>_sum_net = sum - bg x
+    n_px. Centers are rounded to whole pixels; pixels off the image or NaN (tiles never
+    acquired) are left out, and a dumbbell with none left reads NaN."""
+    from .grid import dumbbell_mask
+
+    image = np.asarray(image, float)
+    H, W = image.shape
+    stamp, (sx, sy) = dumbbell_mask(radius, dumbbell)
+    gap, outer = ring if ring is not None else (None, None)
+    if ring is not None:
+        near, (nx, ny) = dumbbell_mask(radius, dumbbell, margin=gap)
+        far, (fx, fy) = dumbbell_mask(radius, dumbbell, margin=outer)
+        # the ring, on the far stamp's grid: within `outer` of the outline, beyond `gap`
+        band = far.copy()
+        band[ny - fy:ny - fy + near.shape[0], nx - fx:nx - fx + near.shape[1]] &= ~near
+    cx, cy = np.asarray(cx, float), np.asarray(cy, float)
+    tags = chamber_tags(columns, *cx.shape)
+
+    def window(x, y, mask, ox, oy):
+        """The image pixels under `mask` placed with its (0, 0) at (x + ox, y + oy)."""
+        x0, y0 = int(round(x)) + ox, int(round(y)) + oy
+        h, w = mask.shape
+        a, b = max(0, y0), min(H, y0 + h)
+        c, d = max(0, x0), min(W, x0 + w)
+        if a >= b or c >= d:
+            return np.empty(0)
+        values = image[a:b, c:d][mask[a - y0:b - y0, c - x0:d - x0]]
+        return values[np.isfinite(values)]
+
+    rows = []
+    for (r, c), x in np.ndenumerate(cx):
+        y = cy[r, c]
+        v = window(x, y, stamp, sx, sy)
+        rec = {"mark_row": r, "mark_col": c, "tag": tags[r, c], "x": x, "y": y,
+               f"{prefix}_sum": v.sum() if v.size else np.nan, f"{prefix}_mean": v.mean() if v.size else np.nan,
+               f"{prefix}_n_px": v.size}
+        if ring is not None:
+            b = window(x, y, band, fx, fy)
+            rec[f"{prefix}_bg"] = np.median(b) if b.size else np.nan
+            rec[f"{prefix}_sum_net"] = rec[f"{prefix}_sum"] - rec[f"{prefix}_bg"] * v.size
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def dumbbell_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, dumbbell, ring=(2.0, 10.0),
+                        prefix="dumbbell", name=None):
+    """Per-pass dumbbell intensities of every chamber of a kinetic run (dumbbell_intensities
+    at each frame of the (time, y, x) `stack`), one row per chamber x frame, with `frame`,
+    `seconds` (the time of the tile the reaction chamber's center falls in, as
+    chamber_timecourse) and each column minus the chamber's frame-0 value (<col>_minus_frame0).
+    The readout for something in solution across both chambers, e.g. GFP while it is
+    expressed in the DNA chamber and moves through the neck. `name` records the readout as a
+    step of the pipeline's record (analysis.steps)."""
+    from .stitch import chamber_seconds
+
+    seconds = chamber_seconds(tiled["seconds"].values, cx, cy, tile_px)
+    parts = []
+    for k in range(stack.shape[0]):
+        frame = np.asarray(stack[k], np.float32)
+        d = dumbbell_intensities(frame, cx, cy, columns, radius=radius, dumbbell=dumbbell, ring=ring, prefix=prefix)
+        d.insert(0, "frame", k)
+        d["seconds"] = seconds[k].ravel()
+        parts.append(d)
+    df = pd.concat(parts, ignore_index=True)
+    keys = ["mark_row", "mark_col"]
+    first = df[df["frame"] == df["frame"].min()].set_index(keys)
+    idx = df.set_index(keys).index
+    for col in [c for c in df.columns if c.startswith(prefix) and not c.endswith("_n_px")]:
+        df[f"{col}_minus_frame0"] = df[col].to_numpy() - idx.map(first[col]).to_numpy()
+    if name is not None:
+        from ..analysis.steps import tally_step
+
+        tally_step(f"dumbbell_timecourse_{prefix}", "Read every pass per dumbbell",
+                   [f"sum over the reaction chamber ({radius:g} px), its DNA chamber",
+                    f"({dumbbell['dna_radius']:g} px, {dumbbell['dna_dx']:g}, {dumbbell['dna_dy']:g} px away) and the neck "
+                    f"({dumbbell['neck_width']:g} px)"]
+                   + ([f"local background: median of a {ring[0]:g}–{ring[1]:g} px ring around it"] if ring else [])
+                   + [f"{cx.size:,} chambers, every pass"],
+                   name, unit="runs")
+    return df
+
+
+
+def chamber_outside_button(stack, chamber_x, chamber_y, button_x, button_y, *, chamber_radius,
+                           button_radius, gap=2.0, agg="median"):
+    """Each chamber's dye in solution: `agg` of the pixels inside its chamber circle
+    (`chamber_x`, `chamber_y`, `chamber_radius`) and outside its button circle (`button_x`,
+    `button_y`, `button_radius` + `gap`). The two circles need not be concentric. `stack` is
+    one image (y, x) or a (time, y, x) run, read a frame at a time; pixels off the image or
+    NaN (tiles never acquired) are left out. Centers are rounded to whole pixels.
+
+    Returns (agg values, n_px), each (n_rows, n_cols), or (time, n_rows, n_cols) for a run."""
+    single = np.ndim(stack) == 2
+    frames = [stack] if single else stack
+    n_frames = 1 if single else stack.shape[0]
+    shape_yx = np.shape(stack)[-2:]
+    chamber_x, chamber_y = np.asarray(chamber_x, float), np.asarray(chamber_y, float)
+    h = int(np.ceil(chamber_radius)) + 1
+    yy, xx = np.mgrid[-h : h + 1, -h : h + 1]
+    pixels = {}  # chamber -> flat indices of its pixels inside the chamber and outside the button
+    for idx in np.ndindex(chamber_x.shape):
+        x0, y0 = int(round(chamber_x[idx])), int(round(chamber_y[idx]))
+        bx, by = button_x[idx] - x0, button_y[idx] - y0
+        keep = (np.hypot(xx, yy) <= chamber_radius) & (np.hypot(xx - bx, yy - by) > button_radius + gap)
+        py, px = yy[keep] + y0, xx[keep] + x0
+        on = (py >= 0) & (py < shape_yx[0]) & (px >= 0) & (px < shape_yx[1])
+        pixels[idx] = py[on] * shape_yx[1] + px[on]
+    reduce = getattr(np, f"nan{agg}")
+    values = np.full((n_frames,) + chamber_x.shape, np.nan)
+    n_px = np.zeros((n_frames,) + chamber_x.shape, int)
+    for t in range(n_frames):
+        flat = np.asarray(frames[t] if not single else stack, np.float32).ravel()
+        for idx, p in pixels.items():
+            v = flat[p]
+            v = v[np.isfinite(v)]
+            n_px[(t,) + idx] = v.size
+            if v.size:
+                values[(t,) + idx] = reduce(v)
+    return (values[0], n_px[0]) if single else (values, n_px)

@@ -85,3 +85,12 @@ def chamber_tags(layout, n_rows=None, n_cols=None):
     if isinstance(layout, np.ndarray) and layout.ndim == 2:
         return layout.astype("<U200")
     return column_tags(layout, n_rows or 8)[0]
+
+
+def display_tag(tag):
+    """A variant's name for figures: an ester (TAG, amber-suppression) substitution, "*" in the
+    pinlist (e.g. "F22*"), is written with phi ("F22φ"). Other tags are unchanged; tables keep
+    the pinlist's names."""
+    tag = str(tag)
+    return tag[:-1] + "φ" if tag.endswith("*") else tag
+

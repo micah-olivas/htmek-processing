@@ -1,4 +1,4 @@
-"""QC plots: grid overlays, chamber crops over time, chip heatmaps and sparklines; the
+"""QC plots: grid overlays, chamber crops over time, chip heatmaps and sparklines;
 shared plot style."""
 
 from __future__ import annotations
@@ -361,11 +361,17 @@ FIT_COLORS = {"4pl": "#F7C59F", "vmax": "#B54708", "vmax_forced": "#A23B8C", "li
 
 
 def set_plot_style(font="Arial"):
-    """Global matplotlib style for every plot in the pipeline: `font` for all text, and no
-    top/right spines. Call once, after importing matplotlib (e.g. in the notebook setup)."""
+    """Global matplotlib style for every plot in the pipeline: `font` for all text (math text
+    too), and no top/right spines. Call once, after importing matplotlib (e.g. in the notebook setup)."""
     plt.rcParams.update(
         {
             "font.family": font,
+            # math text ($10^6$, subscripts) in the same font, not matplotlib's DejaVu
+            "mathtext.fontset": "custom",
+            "mathtext.rm": font,
+            "mathtext.it": f"{font}:italic",
+            "mathtext.bf": f"{font}:bold",
+            "mathtext.sf": font,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "pdf.fonttype": 42,  # editable text in saved PDFs
@@ -981,4 +987,33 @@ def plot_chip_map(values, title, label, *, n_rows=56, n_cols=32, cmap="Greens", 
     cb.set_label(label)
     cb.outline.set_linewidth(0.8)
     fig.tight_layout()
+    return fig
+
+
+def centering_examples(image, before, after, radius, labels, groups, *, half=30, ncols=6,
+                       title=None, pct=(1, 99.5)):
+    """A sheet of crops showing how a centering step moved its circles: the grid's circle
+    dashed white, the centered one yellow. `before`, `after` = (x, y) arrays (n_rows, n_cols);
+    `labels` names each chamber (e.g. its tag); `groups` = [(name, [(row, col), ...]), ...],
+    each crop titled with its name and the move. Crops are `half` px either side of the
+    grid point, each scaled to its own `pct` percentiles."""
+    cells = [(g, tuple(int(v) for v in k)) for g, ks in groups for k in ks]
+    nrows = max(1, -(-len(cells) // ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.15 * ncols, 2.3 * nrows + 0.6), squeeze=False)
+    (bx, by), (ax_, ay) = before, after
+    move = np.hypot(ax_ - bx, ay - by)
+    for ax, (g, k) in zip(axes.ravel(), cells):
+        x0, y0 = int(bx[k]), int(by[k])
+        crop = image[y0 - half : y0 + half, x0 - half : x0 + half]
+        lo, hi = np.nanpercentile(crop, pct)
+        ax.imshow(crop, cmap="gray", vmin=lo, vmax=hi, interpolation="nearest")
+        ax.add_patch(plt.Circle((bx[k] - x0 + half, by[k] - y0 + half), radius, fill=False, ec="white", ls="--", lw=1.2))
+        ax.add_patch(plt.Circle((ax_[k] - x0 + half, ay[k] - y0 + half), radius, fill=False, ec="#F1C40F", lw=1.4))
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"{labels[k]} ({k[0]}, {k[1]})\n{g}: {move[k]:.1f} px", fontsize=10)
+    for ax in axes.ravel()[len(cells):]:
+        ax.axis("off")
+    if title:
+        fig.suptitle(title, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / fig.get_figheight()) if title else None)
     return fig
