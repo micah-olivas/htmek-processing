@@ -20,7 +20,10 @@ def guess_mm(s, v):
 
 
 # Default Michaelis-Menten bounds, as (lower, upper) over [Vmax, Km]: both non-negative.
-BOUNDS_MM = ([0, 0], [np.inf, np.inf])
+BOUNDS_MM = (
+    [0, 0], 
+    [np.inf, np.inf]
+    )
 
 
 def fit_mm(s, v, *, p0=guess_mm, bounds=BOUNDS_MM):
@@ -56,7 +59,7 @@ def fit_mm(s, v, *, p0=guess_mm, bounds=BOUNDS_MM):
         n=len(s),
         km_note="",
     )
-    if len(np.unique(s)) < 3:  # 2 parameters need more than 2 distinct [S]
+    if len(np.unique(s)) < 3:  # fit requires more than 2 unique [S]'s
         return out
 
     scale = np.nanmax(np.abs(v)) or 1.0
@@ -66,6 +69,7 @@ def fit_mm(s, v, *, p0=guess_mm, bounds=BOUNDS_MM):
     upper = np.asarray(bounds[1], float) / unit
     start = np.asarray(p0(s, v) if callable(p0) else p0, float) / unit
     start = np.clip(start, lower, upper)
+    
     try:
         popt, pcov = curve_fit(
             michaelis_menten, s, y, p0=start, bounds=(lower, upper), maxfev=10_000

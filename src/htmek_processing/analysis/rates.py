@@ -48,6 +48,7 @@ import numpy as np
 import pandas as pd
 
 from ..processing.quantify import bleach_correct, fit_bleaching
+from .steps import record_step
 
 
 def fit_lines(
@@ -517,6 +518,15 @@ def flag_early_depletion(rates, traces, *, t="seconds", per=("mark_row", "mark_c
     half_done = out["c"] <= out["_t0"] + max_half_rise * (out["_t1"] - out["_t0"])
     out["depleted_early"] = ((out["model"] == "linear") & early_peak & half_done
                              & (out["rise_snr"] >= min_rise_snr))
+    record_step("flag_early_depletion", "Depleted early",
+                ["flagged when:",
+                 "- kept on the line, though the 4PL beats it (BIC)",
+                 f"- the 4PL rises ≥ {min_rise_snr:g}× the scatter",
+                 "- its steepest point is at or before frame 0",
+                 "- its half-rise is " + ("inside the run" if max_half_rise >= 1
+                                          else f"in the first {max_half_rise:.0%} of the run")],
+                n=len(out), branches=[dict(text="flagged depleted early", n=out["depleted_early"].sum(),
+                                           level="warn")])
     return out.drop(columns=["_t0", "_t1"])
 
 def force_4pl_on_depleted(rates, traces, *, t="seconds", per=("mark_row", "mark_col"), rate="v0"):
@@ -532,6 +542,10 @@ def force_4pl_on_depleted(rates, traces, *, t="seconds", per=("mark_row", "mark_
         d = out.loc[sel]
         out.loc[sel, rate] = slope_4pl_in_window(d["a"], d["d"], d["c"], d["b"], d["_t0"], d["_t1"])
         out.loc[sel, "model"] = "4pl_forced"
+    record_step("force_4pl_on_depleted", "Forced 4PL",
+                ["`v0`: the 4PL's steepest slope inside the run",
+                 "(never extrapolated before frame 0)"],
+                n=len(out), branches=[dict(text="`v0` from the forced 4PL", n=sel.sum(), level="warn")])
     return out.drop(columns=["_t0", "_t1"])
 
 
@@ -544,6 +558,10 @@ def flag_poor_4pl(rates, *, min_r2_4pl=0.98, name="left_out_of_mm"):
     156.25 µM, 0.98 caught 533 of the 576 runs in the rows with a mid-run dip."""
     out = rates.copy()
     out[name] = ~(out["r2_4pl"] >= min_r2_4pl)  # NaN (no 4PL) is left out too
+    record_step("flag_poor_4pl", "Poor 4PL fits",
+                [f"4PL r² over the whole run < {min_r2_4pl:g}",
+                 "(an imaging step, or no rise above noise)"],
+                n=len(out), branches=[dict(text="left out of the MM fits", n=out[name].sum(), level="fail")])
     return out
 
 def subtract_blank_rate(rates, *, run="bzp_uM", rate="v0", ref_tags=("BLANK",)):
@@ -556,7 +574,34 @@ def subtract_blank_rate(rates, *, run="bzp_uM", rate="v0", ref_tags=("BLANK",)):
     out[f"{rate}_unsubtracted"] = out[rate]
     out[f"blank_median_{rate}"] = out[run].map(ref)
     out[rate] = out[rate] - out[f"blank_median_{rate}"]
+    record_step("subtract_blank_rate", "BLANK rate subtracted",
+                [f"each run's {', '.join(ref_tags)} median `{rate}` subtracted",
+                 "from every chamber in that run"],
+                n=len(out), branches=[dict(text="rate changed", n=len(out), level="warn")])
     return out
+
+
+def leave_out_points(traces, value, *, s="bzp_uM", frame="frame", floor=None, last_frame=None):
+    """Leave points out of the rate fits (they stay in `value`, plotted and exported):
+    any point below `floor` (in `value`'s units; e.g. -20 µM, below which a calibrated
+    [NADH] is not real), and, per run, the frames after `last_frame` = {[S]: last frame
+    kept} (e.g. an imaging artifact late in one run). Returns (traces with f"{value}_fit",
+    NaN where left out; the boolean mask of points kept), and records the step."""
+    keep = pd.Series(True, index=traces.index)
+    branches, rule = [], []
+    if floor is not None:
+        low = traces[value] < floor
+        keep &= ~low
+        rule.append(f"`{value}` below {floor:g}".replace("-", "−"))
+        branches.append(dict(text=f"below {floor:g}".replace("-", "−"), n=low.sum(), level="fail"))
+    for s_val, last in (last_frame or {}).items():
+        late = (traces[s] == s_val) & (traces[frame] > last)
+        rule.append(f"`{s}` = {s_val:g}: frames after {last}")
+        branches.append(dict(text=f"{s_val:g}: frames > {last}", n=(late & keep).sum(), level="fail"))
+        keep &= ~late
+    record_step("leave_out_points", "Points left out", rule or ["none"], n=len(traces),
+                unit="points", branches=branches)
+    return traces.assign(**{f"{value}_fit": traces[value].where(keep)}), keep
 
 
 def fit_progress_curves(
@@ -632,6 +677,22 @@ def fit_progress_curves(
         kw["max_rise_frac"] = kw["plateau_min_frac"] = None
     rates = fit_4pl_rates(out, value=fitted, t=t, end=end, per=per, p0=p0, bounds=bounds,
                           substrate=substrate, n_jobs=n_jobs, **kw)
+    s_rules = (f"rise ≤ {kw['max_rise_frac']:g}× [S]; plateau ≥ {kw['plateau_min_frac']:g}× [S]"
+               if kw.get("max_rise_frac") is not None else "[S] rules off")
+    record_step("fit_progress_curves", "Line and 4PL per run",
+                ["`v0`: the 4PL's steepest slope if every rule",
+                 "holds, else the line's slope. The 4PL must:",
+                 "- beat the line by BIC",
+                 *(["- rise (Vmax ≥ 0)"] if kw.get("rising") else []),
+                 "- peak inside the run (`b` > 1)",
+                 "- rise over ≥ 1 frame interval (10–90 %)",
+                 *([f"- rise ≥ {kw['min_rise_snr']:g}× the scatter"] if kw.get("min_rise_snr") else []),
+                 "- " + s_rules,
+                 "bleach correction: " + {None: "none", "model": "fit to the BLANKs",
+                                          "ratio": "BLANK median by frame"}.get(bleach, str(bleach))],
+                n=len(rates), branches=[dict(text="`v0` from the 4PL", n=(rates["model"] == "4pl").sum(), level="pass"),
+                                        dict(text="`v0` from the line", n=(rates["model"] == "linear").sum(),
+                                             level="info")])
     return out, rates.rename(columns={"vmax": "v0", "vmax_4pl": "v0_4pl"})
 
 

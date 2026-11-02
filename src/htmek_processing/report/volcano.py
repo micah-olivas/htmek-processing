@@ -29,6 +29,10 @@ The method:
     and n from the pool with replacement, record t* = |median(m draws) - median(n draws)|;
     p = (#(t* >= t_obs) + 1) / (N + 1), with t_obs the observed |difference of medians|.
     N steps through BOOT_STEPS (100 -> 1,000 -> 100,000) while p is small.
+  - A fixed reference (`fixed_reference`, e.g. a Km measured on another chip when WT did not
+    express here) replaces the reference chambers with one value: fold change = the variant's
+    median minus it, in log2; p from bootstrap_p_fixed (the variant's chambers, shifted to
+    the reference's median, resampled). Marked as a placeholder on the plot when it is one.
   - The 95 % interval of the fold change resamples the variant's chambers alone.
 """
 
@@ -65,7 +69,7 @@ class Quantity:
 
 def quantities(rate_unit="µM/s", s_unit="µM"):
     """Km, Vmax / GFP and kcat/Km, with units from the rate's (`rate_unit`) and [S]'s."""
-    per_gfp = f"{rate_unit} per GFP count"
+    per_gfp = f"{rate_unit} per GFP RFU"
     return [
         # Km beyond the [S] range: > highest points right, < lowest points left
         Quantity("km", "raw", "K$_m$", s_unit, "km", {"": "o", "lower": ">", "upper": "<"}),
@@ -173,19 +177,50 @@ def bootstrap_p(v, ref, rng, *, steps=BOOT_STEPS, chunk=10_000):
     return p
 
 
+def bootstrap_p_fixed(v, ref, rng, *, steps=BOOT_STEPS, chunk=10_000):
+    """Bootstrap test of a median against a fixed value `ref` (log2 units, as `v`): shift
+    the variant's values so their median is `ref` (the null), draw m of them with
+    replacement, and count how often |median - ref| reaches the observed one. Iterations
+    step up through `steps` while p stays small; p = (count + 1) / (N + 1)."""
+    t_obs = abs(np.median(v) - ref)
+    null, m = v - np.median(v) + ref, len(v)
+    count = done = 0
+    p = 1.0
+    for n_iter, go_on in steps:
+        while done < n_iter:
+            k = min(chunk, n_iter - done)
+            a = np.median(null[rng.integers(0, m, (k, m))], axis=1)
+            count += int((np.abs(a - ref) >= t_obs).sum())
+            done += k
+        p = (count + 1) / (done + 1)
+        if go_on is None or p > go_on:
+            return p
+    return p
+
+
 def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), min_replicates=2,
                   min_ref_chambers=3, p_significant=0.01, require_expressed=True, scans=SCANS,
-                  steps=BOOT_STEPS, seed=0):
+                  steps=BOOT_STEPS, seed=0, fixed_reference=None, reference_lines=None):
     """One row per variant (not in `exclude`): replicates, fold change vs the reference,
     bootstrap p and 95 % interval. Returns (table, ref: the reference's log2 values,
-    s_range)."""
+    s_range).
+
+    `fixed_reference` = {quantity name: dict(value=..., name=..., placeholder=bool)} tests
+    that quantity against one value (in its unit, e.g. Km in µM) instead of reference
+    chambers, e.g. {"km": dict(value=704, name="MBO-040 WT", placeholder=True)}.
+    `reference_lines`, in the same form, only marks such a value on the plot (a dashed
+    line at its fold change from the reference), leaving the test as it is."""
     s_range = (rates["bzp_uM"].min(), rates["bzp_uM"].max())
     ok = chamber_values(q, fits, rates, s_range, require_expressed=require_expressed)
     sd, _ = pooled_replicate_sd(ok["log2_value"], ok["tag"])
     ref = ok.loc[ok["tag"] == reference, "log2_value"].to_numpy()
     ref_label = reference
     library = ok[~ok["tag"].isin(exclude)]
-    if len(ref) < min_ref_chambers:  # e.g. WT did not express: every library chamber
+    fixed = (fixed_reference or {}).get(q.name)
+    if fixed is not None:   # one value, e.g. from another chip
+        ref = np.array([np.log2(fixed["value"])])
+        ref_label = fixed.get("name", f"{fixed['value']:g}")
+    elif len(ref) < min_ref_chambers:  # e.g. WT did not express: every library chamber
         ref = library["log2_value"].to_numpy()
         ref_label = "library median"
 
@@ -197,9 +232,12 @@ def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), mi
         tested = n >= min_replicates
         v = g["log2_value"].to_numpy()
         # the library reference leaves out the tested variant's own chambers
-        ref_v = ref if ref_label == reference else library.loc[library["tag"] != tag, "log2_value"].to_numpy()
+        ref_v = (ref if fixed is not None or ref_label == reference
+                 else library.loc[library["tag"] != tag, "log2_value"].to_numpy())
         fc = np.median(v) - np.median(ref_v)
-        p = bootstrap_p(v, ref_v, rng, steps=steps) if tested else np.nan
+        test = (lambda: bootstrap_p_fixed(v, ref_v[0], rng, steps=steps)) if fixed is not None else \
+            (lambda: bootstrap_p(v, ref_v, rng, steps=steps))
+        p = test() if tested else np.nan
         boot = np.median(v[rng.integers(0, n, (10_000, n))], axis=1) - np.median(ref_v)
         lo95, hi95 = np.percentile(boot, [2.5, 97.5])
         rows.append({
@@ -228,11 +266,13 @@ def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), mi
     table["unit"] = q.unit
     table["reference"] = ref_label
     table["reference_median"] = 2 ** np.median(ref)
-    table["reference_n_chambers"] = len(ref)
+    table["reference_n_chambers"] = 0 if fixed is not None else len(ref)
+    table["reference_placeholder"] = bool(fixed is not None and fixed.get("placeholder", False))
     table["replicate_sd_log2"] = sd
     table["bzp_range_uM"] = f"{s_range[0]:g}-{s_range[1]:g}"
     table.attrs.update(p_significant=p_significant, min_replicates=min_replicates,
-                       reference=reference, steps=steps)
+                       reference=reference, steps=steps, fixed=fixed,
+                       reference_line=(reference_lines or {}).get(q.name))
     return table, ref, s_range
 
 
@@ -329,10 +369,19 @@ def plot_volcano(q, table, ref, s_range, *, label_top_n=4, min_r2=0.9):
                            clip_on=False)
             ax.axvline(0, color="0.5", lw=0.6, zorder=1)
             ax.axhline(-np.log10(p_sig), color="0.3", lw=0.8, ls="--", zorder=1)
+            line = table.attrs.get("reference_line")
+            if line is not None:   # a value from elsewhere (e.g. another chip's WT), marked only
+                x_line = np.log2(line["value"]) - np.median(ref)
+                ax.axvline(x_line, color="#B9770E", lw=1.2, ls="--", zorder=2)
+                if k == 0:
+                    ax.annotate(f"{line['name']} {line['value']:,.0f} {q.unit}"
+                                + (" (PLACEHOLDER)" if line.get("placeholder") else ""),
+                                (x_line, 1.0), xycoords=("data", "axes fraction"), xytext=(3, -3),
+                                textcoords="offset points", ha="left", va="top", fontsize=7.5,
+                                color="#B9770E", weight="bold")
             ax.set_xlim(-lim, lim)
             ax.set_ylim(0, y_top)
-            ax.set_xlabel(f"log$_2$ fold change in {q.label}\n"
-                          f"(variant / {reference if ref_label == reference else 'library median'})")
+            ax.set_xlabel(f"log$_2$ fold change in {q.label}\n(variant / {ref_label})")
             if k == 0:
                 ax.set_ylabel("−log$_{10}$ p")
                 ax.annotate(f"p = {p_sig:g}", (-lim, -np.log10(p_sig)), xytext=(3, -3),
@@ -372,11 +421,23 @@ def plot_volcano(q, table, ref, s_range, *, label_top_n=4, min_r2=0.9):
                        "(lower bound)",
                "kcat_km": f"per-GFP MM fit r² ≥ {min_r2:g}; k$_{{cat}}$/K$_m$ = (v$_{{max}}$/GFP) / K$_m$"}[q.name]
         n_ref = len(ref)
-        ref_text = (f"Reference: {reference}, {value_text} ({n_ref} chambers)." if ref_label == reference else
-                    f"Reference: library median, {value_text} ({n_ref:,} chambers; {reference} did not express).")
+        fixed = table.attrs.get("fixed")
+        placeholder = bool(table["reference_placeholder"].iloc[0]) if "reference_placeholder" in table else False
+        if fixed is not None:
+            ref_text = (f"Reference: {ref_label}, {value_text}, a fixed value"
+                        + (" (PLACEHOLDER: not measured on this chip)." if placeholder else "."))
+            p_text = ("p: bootstrap test of the variant's median against the fixed reference (its chambers "
+                      "shifted to the reference and resampled).")
+        else:
+            ref_text = (f"Reference: {reference}, {value_text} ({n_ref} chambers)." if ref_label == reference else
+                        f"Reference: library median, {value_text} ({n_ref:,} chambers; {reference} did not express).")
+            p_text = "p: bootstrap test of the difference of medians, variant and reference pooled (Markin et al. 2021)."
         lines = [ref_text,
                  f"Chambers: GFP above the floor; {how}. Variants with ≥ {table.attrs.get('min_replicates', 2)} chambers.",
-                 "p: bootstrap test of the difference of medians, variant and reference pooled (Markin et al. 2021)."]
+                 p_text]
+        if placeholder:   # a tag nobody can miss, top right
+            fig.text(0.99, 1.0, f"PLACEHOLDER reference: {ref_label}, {value_text}", ha="right", va="bottom",
+                     fontsize=9, weight="bold", bbox=dict(facecolor="#FBE7C6", edgecolor="#B9770E", lw=0.8, pad=3))
         # one line each, wrapped to the figure's width (about 15 characters per inch at 7.5 pt)
         width = int(fig.get_size_inches()[0] * 15)
         fig.text(0.01, -0.02, "\n".join(textwrap.fill(line, width) for line in lines), fontsize=7.5,

@@ -22,8 +22,15 @@ KEYS = ["mark_row", "mark_col"]
 SCAN_NAMES = {"A": "Ala", "F": "Phe", "M": "Met"}   # the substitution a tag's last letter names
 SCAN_ORDER = ["WT", "Ala", "Phe", "Met", "N41A"]
 HIGHLIGHT = "#C0392B"   # WT on the Km plots, as on MBO-040's
-RATE_DEFINITIONS = ["linear", "4pl", "dynamic"]
-DEF_COLORS = {"linear": FIT_COLORS["line"], "4pl": FIT_COLORS["vmax"], "dynamic": "#1F4E79"}
+RATE_DEFINITIONS = [
+    "linear", # linear fit to the progress curve
+    "4pl", # the 4PL's steepest slope inside the progress curve window
+    "dynamic"
+    ]
+DEF_COLORS = {"linear": FIT_COLORS["line"], 
+              "4pl": FIT_COLORS["vmax"], 
+              "dynamic": "#1F4E79"
+              }
 
 
 def _conc_label(s):

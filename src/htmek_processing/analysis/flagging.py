@@ -10,14 +10,15 @@ import matplotlib.pyplot as plt
 from ..processing.io import _STD_RE, load_standard_images, n_used_frames, time_coord
 
 
-def save_flags(path, flagged, tags=None):
+def save_flags(path, flagged, tags=None, reasons=None):
     """Write a set of flagged (mark_row, mark_col) to JSON (records: mark_row, mark_col,
-    tag)."""
+    tag, and with `reasons` = {(r, c): text} a reason)."""
     import json
 
-    tags = tags or {}
+    tags, reasons = tags or {}, reasons or {}
     recs = [
-        {"mark_row": r, "mark_col": c, "tag": tags.get((r, c), "")}
+        {"mark_row": r, "mark_col": c, "tag": tags.get((r, c), ""),
+         **({"reason": reasons[(r, c)]} if (r, c) in reasons else {})}
         for (r, c) in sorted(flagged)
     ]
     Path(path).write_text(json.dumps(recs, indent=2))
@@ -33,6 +34,43 @@ def load_flags(path):
         (int(d["mark_row"]), int(d["mark_col"]))
         for d in json.loads(Path(path).read_text())
     }
+
+
+def load_flag_reasons(path):
+    """Read a flags JSON -> {(mark_row, mark_col): reason} ("" where none is given)."""
+    import json
+
+    return {(int(d["mark_row"]), int(d["mark_col"])): d.get("reason", "")
+            for d in json.loads(Path(path).read_text())}
+
+
+def apply_manual_flags(rates, path, *, column="left_out_of_mm"):
+    """Leave chambers flagged manually (a flags JSON with a reason per chamber, e.g. a
+    delamination bridge to the neighboring DNA chamber) out of the MM fits: every run of
+    a flagged chamber gets `column` True, and `manual_flag` holds the reason ("" for the
+    rest). Records the step for the report's flowchart. A missing file flags nothing."""
+    from .steps import record_step
+
+    reasons = load_flag_reasons(path) if Path(path).exists() else {}
+    keys = list(zip(rates["mark_row"].astype(int), rates["mark_col"].astype(int)))
+    out = rates.copy()
+    out["manual_flag"] = [reasons.get(k, "") for k in keys]
+    hit = out["manual_flag"] != ""
+    if column in out:
+        out[column] = out[column] | hit
+    else:
+        out[column] = hit
+    flagged = sorted({k for k, h in zip(keys, hit) if h})
+    counts = {}
+    for k in flagged:
+        counts[reasons[k]] = counts.get(reasons[k], 0) + 1
+    n = len(set(keys))
+    record_step("apply_manual_flags", "Manual flags",
+                [f"chambers listed in `{Path(path).name}`, each with a reason;",
+                 "every run of a flagged chamber is left out of the MM fits"],
+                n=n, unit="chambers",
+                branches=[dict(text=reason, n=k, level="fail") for reason, k in counts.items()])
+    return out
 
 
 def apply_flags(df, flagged, *, drop=False):

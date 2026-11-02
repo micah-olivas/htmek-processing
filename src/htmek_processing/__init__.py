@@ -6,7 +6,8 @@ Three subpackages follow the pipeline:
                  script it runs), grid and grid_adjuster (chamber positions), buttons
                  (magnify button-finding), quantify (per-chamber intensities), chamberqc
                  (button image QC, run in chamberqc's own environment)
-    analysis     per-chamber numbers -> rates, fits, QC: rates (lines, 4PL, rate rules), mm
+    analysis     per-chamber numbers -> rates, fits, QC: rates (lines, 4PL, rate rules), steps (the filters'
+                 record, for the report's flowchart), mm
                  (Michaelis-Menten), standards (NADH standard lines), flagging (excluding
                  chambers), plots and kinetics_qc (QC figures)
     report       chamber (one page per chamber), volcano (per-variant statistics),
@@ -25,6 +26,7 @@ from .processing.layout import (  # noqa: F401
     pinlist_tags,
     mirror_pinlist,
     chamber_tags,
+    display_tag,
 )
 from .processing.io import (  # noqa: F401
     load_image,
@@ -64,10 +66,18 @@ from .processing.grid import (  # noqa: F401
     load_warp,
     save_warp,
     warped_grid,
+    DUMBBELL_FIELDS,
+    dumbbell_mask,
+    dumbbell_outline,
     unit_cell_average,
     fit_chamber_wall,
     find_buttons,
     snap_to_spots,
+    center_on_spots,
+    center_on_discs,
+    shift_from_neighbors,
+    save_centers,
+    load_centers,
 )
 from .processing.quantify import (  # noqa: F401
     _circ_mask,
@@ -81,6 +91,9 @@ from .processing.quantify import (  # noqa: F401
     bleach_model,
     fit_bleaching,
     chamber_timecourse,
+    dumbbell_intensities,
+    dumbbell_timecourse,
+    chamber_outside_button,
 )
 from .processing.grid_adjuster import (  # noqa: F401
     GridAdjuster,
@@ -102,6 +115,7 @@ from .analysis.plots import (  # noqa: F401
     CONTROL_COLORS,
     plot_control_traces,
     plot_chip_map,
+    centering_examples,
 )
 from .processing.chamberqc import (  # noqa: F401
     CHAMBERQC_REPO,
@@ -122,12 +136,21 @@ from .analysis.rates import (  # noqa: F401
     _fit_4pl_summary,
     fit_4pl_rates,
     PROGRESS_4PL_RULES,
+    leave_out_points,
     fit_progress_curves,
     flag_early_depletion,
     force_4pl_on_depleted,
     flag_poor_4pl,
     subtract_blank_rate,
     normalize_rates,
+)
+from .analysis.steps import (  # noqa: F401
+    record_step,
+    tally_step,
+    pipeline_steps,
+    clear_steps,
+    save_steps,
+    load_steps,
 )
 from .analysis.mm import (  # noqa: F401
     michaelis_menten,
@@ -168,6 +191,8 @@ from .report import (  # noqa: F401
 from .analysis.flagging import (  # noqa: F401
     save_flags,
     load_flags,
+    load_flag_reasons,
+    apply_manual_flags,
     apply_flags,
     _thumb_png,
     ChamberFlagger,
@@ -220,6 +245,12 @@ __all__ = [
     "fit_chamber_wall",
     "find_buttons",
     "snap_to_spots",
+    "centering_examples",
+    "center_on_spots",
+    "center_on_discs",
+    "shift_from_neighbors",
+    "save_centers",
+    "load_centers",
     "intensities_at",
     "centers_to_df",
     "manual_grid",
@@ -229,6 +260,7 @@ __all__ = [
     "bleach_model",
     "fit_bleaching",
     "chamber_timecourse",
+    "chamber_outside_button",
     "GridAdjuster",
     "show_grid",
     "show_chamber_timeseries",

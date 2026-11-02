@@ -15,8 +15,8 @@ from ..analysis.mm import michaelis_menten
 
 # Version of the chamber report's layout and content. Bump it whenever the report changes
 # (what a page shows, how it is drawn, or a rule it displays), and add an entry to
-# chamber_report_changelog.md next to the report PDF (5_figures/4_report/).
-REPORT_VERSION = "1.9.4"
+# docs/chamber_report_changelog.md in this repo.
+REPORT_VERSION = "1.10.0"
 
 REPORT_COLORS = {
     "this": "#1F4E79",  # this chamber
@@ -210,6 +210,10 @@ def _early_zoom(ax, d, value, f, is_4pl, lo, hi):
     ins.keep_frame = True
 
 
+# a faint white box behind a label that may sit on a line
+LABEL_BOX = dict(facecolor="white", alpha=0.6, edgecolor="none", pad=0.8)
+
+
 def _label_standards(ax, conc, val, line, fontsize=7.5):
     """Label the standards of the zoom inset with their [NADH]: each label anchored on the
     fitted line at its concentration (not on the point, which scatters about it), all at the
@@ -221,7 +225,7 @@ def _label_standards(ax, conc, val, line, fontsize=7.5):
     if line is None:
         for c, v in zip(conc, val):
             ax.annotate(f"{c:g}", (c, v), xytext=(5, -5), textcoords="offset points", ha="left",
-                        va="top", fontsize=fontsize, zorder=6)
+                        va="top", fontsize=fontsize, zorder=6, bbox=LABEL_BOX)
         return
     to_px, to_data = ax.transData.transform, ax.transData.inverted().transform
     on_line = to_px(np.c_[conc, line["slope"] * np.asarray(conc) + line["intercept"]])
@@ -234,7 +238,7 @@ def _label_standards(ax, conc, val, line, fontsize=7.5):
         else:
             spot = on_line[i] + offset
         ax.annotate(f"{c:g}", (c, v), xytext=to_data(spot), textcoords="data", ha="left",
-                    va="bottom" if flat else "top", fontsize=fontsize, zorder=6)
+                    va="bottom" if flat else "top", fontsize=fontsize, zorder=6, bbox=LABEL_BOX)
 
 
 def _left_out(fit):
@@ -382,15 +386,19 @@ def _report_page(page, value, norm_col):
     km = page.get("km")  # Km strip, when raw MM fits were given
     # rows, as (top, height) in inches from the top of the page
     top_a = 0.9  # table + image crops
-    top_b, h_b = top_a + P["col_w"] + 0.6, 1.15  # progress curves
+    top_b, h_b = top_a + P["col_w"] + 0.85, 1.15  # progress curves, clear of the crops' captions
     top_c, h_c = top_b + h_b + 0.75, 2.5  # rate-vs-[BzP] panels (square) and key
     std = page.get("standards")  # this chamber's NADH standards and calibration line, if given
     # with the standard curve as a third square, the key moves to a band under the row
-    h_key = 1.2 if std is not None else 0.0  # the legend band: 3 rows
-    top_d, h_d = top_c + h_c + 0.85 + h_key, 0.75  # Km and Vmax / [E] strips
+    show_legend = page.get("show_legend", False)  # only on the key page's sample
+    h_key = 1.2 if std is not None and show_legend else 0.0  # the legend band: 3 rows
+    top_d, h_d = top_c + h_c + 0.75 + h_key, 0.66  # Km and Vmax / [E] strips (title inside)
     vm = page.get("vmax")  # the Vmax / [E] strip, when normalized fits were given
     legend_h = 0.4 if km is not None and vm is not None else 0.0  # their shared key
-    H = (top_d + h_d + legend_h if km is not None else top_c + h_c) + 0.65  # page height
+    kc, v0t = page.get("kcat"), page.get("v0_top")  # the second strip row, when given
+    top_e = top_d + h_d + 0.6  # kcat/Km and v0 strips, under Km and Vmax / [E]
+    bottom = top_e + h_d if (kc is not None or v0t is not None) else top_d + h_d
+    H = (bottom + legend_h if km is not None else top_c + h_c) + 0.65  # page height
 
     with plt.rc_context(_REPORT_STYLE):
         fig = plt.figure(figsize=(P["w"], H))
@@ -496,11 +504,15 @@ def _report_page(page, value, norm_col):
             isinstance(v, (int, float, np.number)) and v > page["info_floors"][lab]
             for lab, v in page["info"] if lab in page["info_floors"]
         )
-        overall = ("fail" if not e_ok else "vmax only" if not raw_ok
+        # a chamber flagged manually (an `info` column "manual flag", e.g. "delam bridge") fails
+        manual = next((v for lab, v in page["info"] if lab == "manual flag"), "")
+        flagged = isinstance(manual, str) and manual not in ("", "no")
+        overall = ("flagged" if flagged else "fail" if not e_ok else "vmax only" if not raw_ok
                    else "conditional" if conditional else "pass")
         info.append(["overall", overall])
         fills[(len(info) - 1, 4)] = REPORT_COLORS[
-            {"pass": "pass", "conditional": "warn", "vmax only": "warn", "fail": "fail"}[overall]]
+            {"pass": "pass", "conditional": "warn", "vmax only": "warn", "fail": "fail",
+             "flagged": "fail"}[overall]]
         for j, f in enumerate(fits_mm):  # a fit that left a run out: amber
             if f is not None and (_left_out(f) is not None or n_dep):
                 fills[(3, j + 1)] = REPORT_COLORS["warn"]
@@ -514,6 +526,8 @@ def _report_page(page, value, norm_col):
                     fills[(i, 4)] = REPORT_COLORS["fail"]
             if label == "tile seam" and cell_value not in ("no", "", False, None):
                 fills[(i, 4)] = REPORT_COLORS["warn"]
+            if label == "manual flag" and flagged:
+                fills[(i, 4)] = REPORT_COLORS["fail"]
         n = max(len(mm_rows), len(info))
         mm_rows += [["", "", ""]] * (n - len(mm_rows))
         info = info + [["", ""]] * (n - len(info))
@@ -532,8 +546,14 @@ def _report_page(page, value, norm_col):
             col_widths=[w / sum(widths) for w in widths],
             fills=fills,
         )
+        # a manual flag's label and reason are longer than the others: smaller, so they fit
+        for i, (label, _) in enumerate(info):
+            if label == "manual flag":
+                ax.tables[0][i + 1, 3].get_text().set_fontsize(9.5)
+                if flagged:
+                    ax.tables[0][i + 1, 4].get_text().set_fontsize(8)
         ax.annotate(
-            f"v$_{{max}}$ in {rate_unit} (raw), {rate_unit} per {enzyme} count (per [E])",
+            f"v$_{{max}}$ in {rate_unit} (raw), {rate_unit} per {enzyme} RFU (per [E])",
             (0, 0),
             xycoords="axes fraction",
             xytext=(0, -3),
@@ -797,7 +817,7 @@ def _report_page(page, value, norm_col):
             ax.set_ylim(min(lo, 0), max(hi, wt_vmax * k * 1.12))
         unit = "" if exp == 0 else f"×10$^{{{exp}}}$ "
         ax.set_title(
-            f"v$_0$ / {enzyme} ({unit}{rate_unit} per count)",
+            f"v$_0$ / {enzyme} ({unit}{rate_unit} per RFU)",
             loc="left",
             fontsize=11.5,
         )
@@ -860,7 +880,7 @@ def _report_page(page, value, norm_col):
                     sp.set_linewidth(0.6)
                 zoom.keep_frame = True  # exempt from the page-wide top/right spine removal
             ax.set_xlabel("[NADH] (µM)")
-            ax.set_title("NADH standards (counts)", loc="left", fontsize=11.5)
+            ax.set_title("NADH standards (RFU)", loc="left", fontsize=11.5)
             if line is not None:
                 fig.key["standards_fit"] = ax.text(
                     0.96, 0.05,
@@ -870,14 +890,15 @@ def _report_page(page, value, norm_col):
                     bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5))
 
         # the key: right of the normalized panel, or in a band under the row when the
-        # standard curve takes that place
-        if std is not None:
+        # standard curve takes that place. Chamber pages draw none: the key page's sample does
+        if show_legend and std is not None:
             key = box(col[0], top_c + h_c + 0.75, P["w"] - col[0] - 0.1, h_key - 0.25)
-        else:
+        elif show_legend:
             key_l = col[2] + h_c + 0.45
             key = box(key_l, top_c, P["w"] - key_l - 0.1, h_c)
-        fig.key["legend"] = key
-        key.axis("off")
+        if show_legend:
+            fig.key["legend"] = key
+            key.axis("off")
         handles = [
             plt.Line2D(
                 [],
@@ -911,18 +932,19 @@ def _report_page(page, value, norm_col):
             plt.Line2D([], [], ls="--", lw=1.0, color=REPORT_COLORS["wt"],
                        label="WT v$_{max}$ / [E] (median, passing)"),
         ]
-        if page.get("blank_curve"):
+        if show_legend and page.get("blank_curve"):
             handles.append(plt.Line2D([], [], marker="s", ms=3.5, lw=1.0, color="0.6", mec="0.35", mew=0.4,
                                       label="BLANK median v$_0$"))
-        key.legend(
-            handles=handles,
-            loc="upper left",
-            frameon=False,
-            borderaxespad=0,
-            handlelength=1.6,
-            ncol=3 if std is not None else 1,  # a band under the row, or a column beside it
-            columnspacing=1.2,
-        )
+        if show_legend:
+            key.legend(
+                handles=handles,
+                loc="upper left",
+                frameon=False,
+                borderaxespad=0,
+                handlelength=1.6,
+                ncol=3 if std is not None else 1,  # a band under the row, or a column beside it
+                columnspacing=1.2,
+            )
         if km is not None and vm is not None:
             # Km (cols 1-3) and Vmax / [E] (cols 4-6) side by side, one key below both
             strip_w = col[2] + P["col_w"] - col[0]
@@ -932,7 +954,17 @@ def _report_page(page, value, norm_col):
             fig.key["vmax_strip"] = box(col[3], top_d, strip_w, h_d)
             fig.key["vmax_data"] = vm
             _km_row(fig.key["vmax_strip"], vm, tag, name="v$_{max}$ / [E]",
-                    unit=f"{rate_unit} per {enzyme} count", log=True, legend=False)
+                    unit=f"{rate_unit} per {enzyme} RFU", log=True, legend=False)
+            # second row: kcat/Km (per [E]) under Km, v0 at the highest [S] under Vmax / [E]
+            if kc is not None:
+                fig.key["kcat_strip"] = box(col[0], top_e, strip_w, h_d)
+                _km_row(fig.key["kcat_strip"], kc, tag, name="k$_{cat}$/K$_m$",
+                        unit=page.get("kcat_unit") or f"{rate_unit} per {enzyme} RFU per µM", log=True,
+                        legend=False, note=page.get("kcat_note"))
+            if v0t is not None:
+                fig.key["v0_strip"] = box(col[3], top_e, strip_w, h_d)
+                _km_row(fig.key["v0_strip"], v0t, tag, name=f"v$_0$ at {page['s_top']:g} µM",
+                        unit=rate_unit, log=True, legend=False, sci=False)
             # no key under the strips: the gray points and off-scale triangles are in the key page
         elif km is not None:
             fig.key["km"] = box(col[0], top_d, col[3] + P["col_w"] - col[0], h_d)
@@ -1043,18 +1075,19 @@ def _log_minor_ticks(axis):
     axis.set_minor_formatter(ticker.NullFormatter())
 
 
-def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
+def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True, note=None, sci=True):
     """Every chamber's value (Km by default) as a thin horizontal strip. The axis runs to
     km["xmax"] (for Km, the highest [S]), linear from 0, or with `log` from km["xmin"]
-    (log=True: base 10; log=2: base 2, ticked at each doubling from xmin, i.e. at each [S]
-    of a two-fold dilution series);
+    (log=True: base 10; log=2: base 2, ticked at round numbers, 1, 2 and 5 per decade);
     values beyond it are off scale and sit at the edge as triangles (> above, < below).
     Other variants are gray: every chamber with a value, all as the same small point. This
     variant's other chambers are light blue and this chamber dark blue, both outlined in
     black and always shown; their fits below the r² filter are drawn open. The WT median
     (red) and this variant's median (dark blue, passing chambers only) are labeled dashed
     lines. Each point is (value, jitter) with the chamber's fixed jitter, so every chamber
-    sits in the same place on every page. With `legend`, the key sits to the right."""
+    sits in the same place on every page. With `legend`, the key sits to the right. `note`
+    is a small grey caveat under the strip's right end, e.g. that its unit rests on a
+    placeholder. `sci`=False labels a log axis's ticks as plain numbers (0.1, 1, 10)."""
     xmax = km["xmax"]
     xmin = km.get("xmin", 0.0) if log else 0.0
 
@@ -1062,7 +1095,9 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
     if log == 2:
         ax.set_xscale("log", base=2)
         ax.set_xlim(xmin / 1.15, xmax * 1.15)
-        ticks = xmin * 2.0 ** np.arange(int(np.floor(np.log2(xmax / xmin) + 1e-9)) + 1)
+        # round numbers (1, 2, 5 per decade) inside the [S] range, not each [S]
+        decades = 10.0 ** np.arange(np.floor(np.log10(xmin)), np.ceil(np.log10(xmax)) + 1)
+        ticks = [t for t in np.outer(decades, (1, 2, 5)).ravel() if xmin / 1.15 <= t <= xmax * 1.15]
         ax.set_xticks(ticks, [f"{t:,g}" for t in ticks])
         _log_minor_ticks(ax.xaxis)
     elif log:
@@ -1071,7 +1106,8 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
         _log_minor_ticks(ax.xaxis)
     else:
         ax.set_xlim(0, xmax * 1.03)
-    ax.set_ylim(-0.32, 0.75)  # points jitter within +/- 0.2; the band above is for labels
+    # points jitter within +/- 0.2; above them, one row for the median labels, then the title
+    ax.set_ylim(-0.27, 0.73)
 
     def placed(values):
         """Each value, or the axis edge it lies beyond, and which side ('', '>', '<')."""
@@ -1127,10 +1163,9 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
 
     # Medians as dashed lines, each labeled on the plot (not in the legend), above the
     # points:
-    #   WT       red, top row, just LEFT of its line;
-    #   variant  dark blue, a row lower (so WT-like medians don't collide), just RIGHT of
-    #            its line, unless that would run into the WT label or line: then just LEFT
-    #            of its line, on a white background.
+    #   WT       red, just LEFT of its line;
+    #   variant  dark blue, in the same row, just RIGHT of its line, unless that would run
+    #            into the WT label or line: then just LEFT of its line, on a white background.
     from matplotlib.transforms import blended_transform_factory
 
     on_x = blended_transform_factory(ax.transData, ax.transAxes)
@@ -1140,7 +1175,8 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
 
     def median_line(value, label, color, row_y, side, white_bg=False):
         x_line = float(np.clip(value, xmin if log else -np.inf, xmax))
-        ax.key_lines[label] = ax.axvline(x_line, color=color, ls="--", lw=1.4, zorder=2)
+        # up to the label row, clear of the title above it
+        ax.key_lines[label] = ax.axvline(x_line, ymax=row_y, color=color, ls="--", lw=1.4, zorder=2)
         return ax.annotate(
             label,
             (x_line, row_y),
@@ -1158,11 +1194,11 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
 
     wt_label = None
     if np.isfinite(km["wt"]):
-        wt_label = median_line(km["wt"], "WT", "#C0392B", 0.98, "left")
+        wt_label = median_line(km["wt"], "WT", "#C0392B", 0.72, "left")
 
     if tag != "WT" and np.isfinite(km["variant_median"]):
         var_label = median_line(
-            km["variant_median"], tag, REPORT_COLORS["this"], 0.80, "right"
+            km["variant_median"], tag, REPORT_COLORS["this"], 0.72, "right"
         )
         if wt_label is not None:
             box_var = var_label.get_window_extent(renderer)
@@ -1192,15 +1228,19 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
     ax.scatter([], [], s=20, c="white", ec=REPORT_COLORS["this"], lw=1.3,
                label=f"open: r² < {km['min_r2']}")
     ax.set_yticks([])
-    ax.set_xlabel(f"{name} ({unit})" if unit else name)
-    if log and log != 2:  # base 2 keeps its [S] tick labels
-        ax.xaxis.set_major_formatter(plt.matplotlib.ticker.LogFormatterSciNotation())
+    ax.tick_params(axis="x", which="major", length=8, width=1.1)  # longer than the default: readable
+    ax.tick_params(axis="x", which="minor", length=4.5, width=0.9)  # at the strip's small size
+    ax.set_xlabel(unit)  # the name is the strip's title
+    if log and log != 2:  # base 2 keeps its round-number tick labels
+        ax.xaxis.set_major_formatter(plt.matplotlib.ticker.LogFormatterSciNotation() if sci else
+                                     plt.matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,g}"))
         _log_minor_ticks(ax.xaxis)
     ax.spines["left"].set_visible(False)
-    ax.set_title(
-        f"{name}, all chambers (n={km['n_all']}; {km['n']} with r² ≥ {km['min_r2']})",
-        loc="left",
-    )
+    # the measurement inside the strip's top row, at the left, above the median labels
+    ax.set_title(name, loc="left", fontsize=12, y=0.97, va="top", x=0.008)
+    if note:
+        ax.annotate(note, (1.0, 0), xycoords="axes fraction", xytext=(0, -24), textcoords="offset points",
+                    ha="right", va="top", fontsize=8, style="italic", color="#7F7F7F")
     if legend:
         ax.legend(
             loc="center left",
@@ -1214,12 +1254,19 @@ def _km_row(ax, km, tag, *, name="K$_m$", unit="µM", log=False, legend=True):
 
 def _report_chunk(job):
     """Render a chunk of report pages into one PDF (a worker process's share). With a
-    `key` payload, the key page (_report_key_page, drawn from it) is added at the end."""
+    `key` payload, the key page (_report_key_page, drawn from it) is added at the end; with
+    a `lead` payload (the flowchart's steps and labels), the flowchart page goes first."""
     from matplotlib.backends.backend_pdf import PdfPages
 
-    pages, out, value, norm_col, style, key = job
+    pages, out, value, norm_col, style, key, lead = job
     plt.rcParams.update(style)  # worker processes start with matplotlib's defaults
     with PdfPages(out) as pdf:
+        if lead is not None:
+            from .flowchart import flowchart_pages
+
+            for fig in flowchart_pages(**lead):
+                pdf.savefig(fig)
+                plt.close(fig)
         for page in pages:
             fig = _report_page(page, value, norm_col)
             pdf.savefig(fig)
@@ -1248,7 +1295,7 @@ def _report_key_page(page, value, norm_col):
     import textwrap
 
     # ---- the example page, and where its elements are -------------------------------
-    sample = _report_page(page, value, norm_col)
+    sample = _report_page(dict(page, show_legend=True), value, norm_col)
     sample.canvas.draw()
     renderer = sample.canvas.get_renderer()
     to_frac = sample.transFigure.inverted()
@@ -1394,15 +1441,15 @@ def _report_key_page(page, value, norm_col):
         "v$_0$ ÷ GFP",
         "v$_0$ normalized by the chamber's [E] (GFP); only chambers whose per-[E] fit passes "
         "are shown. Dashed red: WT's v$_{max}$ / [E].")
-    legend = K["legend"].get_legend()
+    legend = K["legend"].get_legend() if "legend" in K else None
     if legend is not None:
         add(("box", box_of(legend), ("tr", "br"), 0), "Legend",
-            "The curves and markers of the panels above.")
+            "The curves and markers of the panels above (shown here only, not on the chamber pages).")
     if km is not None:
         add(("box", union(box_of(K["km"]), box_of(title_of(K["km"]))), ("tr", "br"), 0),
             "K$_m$ of every chamber",
-            "Gray: every chamber with a K$_m$; the title counts them, and those with "
-            "r² ≥ 0.9. Each chamber keeps its height on every page.")
+            "Gray: every chamber with a K$_m$; filled where its fit has r² ≥ 0.9. Each "
+            "chamber keeps its height on every page.")
         if km["this"] is not None:
             add(("ring", point(K["km"], min(km["this"][0], km["xmax"]), km["this"][1]), 0.06),
                 "This chamber's K$_m$",
@@ -1637,8 +1684,22 @@ def chamber_report_pdf(
     rate_unit="µM/s",
     image_captions=None,
     image_pct_high=None,
+    steps=None,
+    enzyme_rfu_per_nm=None,
+    enzyme_placeholder=False,
 ):
     """One PDF page per chamber, for reviewing chambers one by one.
+
+    The first page is a flowchart of the filters (report.flowchart): `steps`, the pipeline's
+    record of its own steps (default: analysis.steps.pipeline_steps(), what this session ran
+    or loaded with load_steps), then the report's own (the MM fits' r² filter, the enzyme
+    floor). With no recorded steps and no MM fits there is no flowchart page.
+
+    `enzyme_rfu_per_nm` converts the enzyme readout to [E] (e.g. GFP button sum RFU per nM
+    enzyme), so the kcat/Km strip reads M⁻¹ s⁻¹ (with the rate in µM/s and the normalized
+    rate per RFU): kcat/Km = vmax / Km × enzyme_rfu_per_nm × 10⁹. `enzyme_placeholder`
+    marks that conversion as a placeholder (not a calibration) on every page's strip and on
+    the flowchart.
 
     Each page shows:
       - top row: tables (the chamber's variant, position and `info`; its MM fits; the rate
@@ -1685,7 +1746,7 @@ def chamber_report_pdf(
 
     `rate_unit` labels every rate on the page: "µM/s" once the signal is calibrated to [NADH]
     (the default, MBO-040), "RFU/s" while it is still raw. The normalized rate is labeled
-    `rate_unit` per count of the enzyme readout.
+    `rate_unit` per RFU of the enzyme readout.
 
     `image_captions` = {image label: text} prints a small caption under that crop, e.g.
     the acquisition it came from. Each image's contrast runs from the 1st to the 99.5th
@@ -1693,7 +1754,8 @@ def chamber_report_pdf(
     the upper limit (more gain), e.g. for dim GFP buttons.
 
     The table's "overall" cell fails the chamber when any `info_floors` value is not above
-    its floor; a raw MM fit below r² >= `km_min_r2` reads "vmax only" (amber): its Km is
+    its floor, and reads "flagged" (red) when an `info` column "manual flag" holds a reason
+    (apply_manual_flags); a raw MM fit below r² >= `km_min_r2` reads "vmax only" (amber): its Km is
     not determined, but its Vmax can still be reported.
 
     The last page is a key: one chamber's page, shrunk, with each element labeled
@@ -1803,6 +1865,53 @@ def chamber_report_pdf(
         vm_wt = vm_ok.loc[vm_ok["tag"] == "WT", "vmax"].median()
         vm_cols = ["vmax", "jitter", "passes"]
         vm_by = vm_all.set_index(key)[vm_cols]
+
+    def strip_table(d, col, seed, passes):
+        """One row per chamber with a positive `col`: value, its fixed jitter, and whether it
+        passes (drawn filled); the axis spans the passing values' 1st-99th percentile."""
+        d = d[key + ["tag", col]].dropna(subset=[col])
+        d = d[d[col] > 0].sort_values(key).copy()
+        d["jitter"] = np.random.default_rng(seed).uniform(-0.2, 0.2, len(d))
+        d["passes"] = passes(d)
+        ok = d[d["passes"]]
+        lim = np.percentile(ok[col], [1, 99]) if len(ok) else (1e-9, 1.0)
+        return d, ok, lim
+
+    # kcat/Km (per [E]): Vmax / Km of the normalized fits, set even where Km is beyond the
+    # [S] range (it is the initial slope); filled where that fit passes the r² filter
+    kcat_scale, kcat_unit, kcat_note = 1.0, None, None
+    if enzyme_rfu_per_nm is not None:   # µM/s per RFU / µM -> M⁻¹ s⁻¹ at [E] = RFU / enzyme_rfu_per_nm nM
+        kcat_scale, kcat_unit = enzyme_rfu_per_nm * 1e9, "M$^{-1}$ s$^{-1}$"
+        if enzyme_placeholder:
+            kcat_note = f"Placeholder slope: {enzyme_rfu_per_nm / 1e3:,.0f}K RFU/nM"
+    kc_data = None
+    if mm is not None and len(mm):
+        kc_src = mm.assign(kcat_km=mm["vmax"] / mm["km"] * kcat_scale)
+        kc_r2 = mm.set_index(key)["r2"]
+        kc_data = strip_table(kc_src, "kcat_km", 2,
+                              lambda d: d.set_index(key).index.map(kc_r2).to_numpy() >= km_min_r2)
+    # v0 at the highest [S] (raw rates): the measured rate, not a fit; filled where the
+    # chamber's raw MM fit passes the r² filter
+    v0_data = None
+    if "vmax" in rates and mm_raw is not None:
+        raw_r2 = mm_raw.set_index(key)["r2"]
+        v0_data = strip_table(rates[rates["bzp_uM"] == max(runs)].rename(columns={"vmax": "v0_top"}),
+                              "v0_top", 3,
+                              lambda d: d.set_index(key).index.map(raw_r2).to_numpy() >= km_min_r2)
+
+    def strip_page(data, col, tag, r, c):
+        """The strip dict _km_row reads, for chamber (r, c) of variant `tag`."""
+        if data is None:
+            return None
+        d, ok, (lo, hi) = data
+        cols = [col, "jitter", "passes"]
+        by = d.set_index(key)[cols]
+        return dict(n=len(ok), n_all=len(d), min_r2=km_min_r2,
+                    others=d.loc[d["tag"] != tag, cols].to_numpy(float), xmin=lo, xmax=hi,
+                    wt=ok.loc[ok["tag"] == "WT", col].median(),
+                    variant_median=ok.loc[ok["tag"] == tag, col].median(),
+                    reps=others(d[d["tag"] == tag], r, c)[cols].to_numpy(float),
+                    this=by.loc[(r, c)].to_numpy(float) if (r, c) in by.index else None)
 
     from datetime import date
 
@@ -1931,6 +2040,11 @@ def chamber_report_pdf(
                     reps=others(vm_all[vm_all["tag"] == tag], r, c)[vm_cols].to_numpy(float),
                     this=vm_by.loc[(r, c)].to_numpy(float) if (r, c) in vm_by.index else None,
                 ),
+                kcat=strip_page(kc_data, "kcat_km", tag, r, c),
+                kcat_unit=kcat_unit,
+                kcat_note=kcat_note,
+                v0_top=strip_page(v0_data, "v0_top", tag, r, c),
+                s_top=max(runs),
             )
         )
 
@@ -1938,6 +2052,17 @@ def chamber_report_pdf(
     key_payload = next((p for p in payloads if (p["row"], p["col"]) == key_chamber), None)
     if extra and key_payload is not None:
         payloads.remove(key_payload)
+
+    # the flowchart page: the pipeline's recorded steps, then the report's own
+    from ..analysis.steps import pipeline_steps
+    from .flowchart import report_steps
+
+    flow = list(pipeline_steps() if steps is None else steps) + report_steps(
+        rates=rates, mm_raw=mm_raw, mm=mm, norm=norm, km_min_r2=km_min_r2,
+        info_floors=info_floors, rate_unit=rate_unit, enzyme_rfu_per_nm=enzyme_rfu_per_nm,
+        enzyme_placeholder=enzyme_placeholder)
+    lead = dict(steps=flow, experiment=experiment or "",
+                stamp=f"chamber report v{version} · built {built}") if flow else None
 
     path = Path(path)
     partial = path.with_suffix(".partial.pdf")
@@ -1947,7 +2072,7 @@ def chamber_report_pdf(
     # default: half the cores, so the machine stays usable while it runs
     n_jobs = n_jobs or max(1, (os.cpu_count() or 2) // 2)
     if n_jobs == 1 or not shutil.which("pdfunite") or len(payloads) < 2 * n_jobs:
-        _report_chunk((payloads, partial, value, norm_col, style, key_payload))
+        _report_chunk((payloads, partial, value, norm_col, style, key_payload, lead))
     else:
         with tempfile.TemporaryDirectory() as tmp:
             # contiguous chunks keep chamber order when the parts are joined
@@ -1955,11 +2080,13 @@ def chamber_report_pdf(
             parts = [Path(tmp) / f"part_{k:03d}.pdf" for k in range(n_jobs)]
             jobs = [
                 (payloads[bounds[k] : bounds[k + 1]], parts[k], value, norm_col, style,
-                 key_payload if k == n_jobs - 1 else None)  # the key goes last
+                 key_payload if k == n_jobs - 1 else None,  # the key goes last
+                 lead if k == 0 else None)  # the flowchart first
                 for k in range(n_jobs)
             ]
             with ProcessPoolExecutor(max_workers=n_jobs) as pool:
                 list(pool.map(_report_chunk, jobs))
             subprocess.run(["pdfunite", *map(str, parts), str(partial)], check=True)
     partial.replace(path)
-    return len(payloads) + (key_payload is not None)
+    n_flow = len({st.get("stage", "rates") for st in flow}) if lead is not None else 0
+    return len(payloads) + (key_payload is not None) + n_flow

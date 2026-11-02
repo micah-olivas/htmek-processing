@@ -44,7 +44,9 @@ def run_chamberqc(images, *, chip, out_dir, tags=None, repo=CHAMBERQC_REPO, revi
     `images` = {name: (image, cx, cy, radius)} or {name: (image, cx, cy, radius, options)},
     with `image` a 2-D array (or a 2-D xarray), `cx`, `cy` the chamber centers in that image
     (n_rows x n_cols), `radius` the button ROI radius (px), and `options` a dict of
-    target ("button" or "dna_chamber"), tile_pitch (px), description.
+    target ("button" or "dna_chamber"), phase ("immobilized", the button's protein, or
+    "solution", the chamber's contents, cut with a wide window that holds the neighboring
+    DNA chambers), tile_pitch (px), description.
     Writes chamberqc's outputs under <out_dir>/<chip>/ (chamberqc_<name>.csv, review_<name>.pdf,
     score_map_<name>.png, run_<name>.json) in one chamberqc run, and returns
     {name: scores table} (one row per chamber: anomaly_score, anomaly_rank, ...)."""

@@ -4,6 +4,7 @@ and the experiment report (the chip-level picture).
     chamber      chamber_report_pdf and its page helpers (was report.py)
     volcano      per-variant fold changes with bootstrap p-values, and the volcano plot
     experiment   experiment_report_pdf: summary, chip maps, rate maps, trends, distributions
+    flowchart    the chamber report's first page: the filters the pipeline ran, as a flowchart
 """
 
 from .chamber import (  # noqa: F401
@@ -33,3 +34,4 @@ from .chamber import (  # noqa: F401
 )
 from . import volcano  # noqa: F401,E402
 from .experiment import experiment_report_pdf  # noqa: F401,E402
+from .flowchart import flowchart_page, flowchart_pages, report_steps  # noqa: F401,E402

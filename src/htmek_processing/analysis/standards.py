@@ -25,10 +25,23 @@ def calibrate_chambers(
     Each chamber gets its own intensity->[NADH] line (illumination varies across the chip);
     invert it later as conc = (signal - intercept) / slope. `conc_max` restricts the fit to
     the linear range (e.g. conc_max=500 to drop high-end self-absorption curvature)."""
+    from .steps import record_step
+
     window = (-np.inf, conc_max) if conc_max is not None else None
-    return fit_lines(
+    cal = fit_lines(
         standards_df, value, x, per=per, keep=keep, window=window, slope_name="slope"
     )
+    conc = sorted(standards_df[x].unique())
+    used = [c for c in conc if conc_max is None or c <= conc_max]
+    ok = cal["slope"].notna()
+    record_step("calibrate_chambers", "Calibrate per chamber",
+                [f"{len(used)} standards, {used[0]:g}–{used[-1]:g} µM; a line per chamber",
+                 f"of `{value}` vs [NADH] (median r² {cal.loc[ok, 'r2'].median():.3f})",
+                 "signal → [NADH] through the chamber's own line"],
+                n=len(cal), unit="chambers", stage="images",
+                branches=[dict(text="calibrated", n=ok.sum(), level="pass")]
+                + ([dict(text="no line", n=(~ok).sum(), level="fail")] if (~ok).any() else []))
+    return cal
 
 
 def predict_conc(

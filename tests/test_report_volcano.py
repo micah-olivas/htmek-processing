@@ -33,3 +33,14 @@ def test_reference_is_wt_or_the_library():
     assert t["reference"].iloc[0] == "library median" and len(ref) == 28
     a1f = t.set_index("tag").loc["A1F"]
     assert a1f["log2_fc"] < 0 and a1f["p_value"] < 0.05  # 6 chambers vs a pool 21 % alike: p ~ 0.02
+
+
+def test_bootstrap_p_fixed_separates_far_values():
+    import numpy as np
+    from htmek_processing.report.volcano import bootstrap_p_fixed
+
+    rng = np.random.default_rng(0)
+    far = np.log2(np.array([3000.0, 3200, 2800, 3100]))
+    near = np.log2(np.array([690.0, 720, 700, 710]))
+    assert bootstrap_p_fixed(far, np.log2(704), rng) < 0.05
+    assert bootstrap_p_fixed(near, np.log2(704), rng) > 0.1

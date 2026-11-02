@@ -63,7 +63,7 @@ class Context:
     s_ticks: list  # [S] of the runs: the Km axes' ticks
     min_r2: float
     p_significant: float
-    reference: str  # "WT" or "library median"
+    reference: str  # "WT", "library median", or a fixed reference's name (e.g. "MBO-040 WT")
     n_rows: int
     n_cols: int
     rate_note: str = ""
@@ -73,16 +73,16 @@ class Context:
 
     @property
     def vmax_unit(self):
-        return f"{self.rate_unit} per GFP count"
+        return f"{self.rate_unit} per GFP RFU"
 
     @property
     def ref_text(self):
-        return "WT" if self.reference == "WT" else "library median"
+        return self.reference
 
 
 # ---- small helpers ------------------------------------------------------------------------
 def counts_format(axis, values=None):
-    """Tick labels for GFP counts in k or M (with a true minus sign), by their size."""
+    """Tick labels for GFP RFU in k or M (with a true minus sign), by their size."""
     big = values is not None and np.nanmax(np.abs(values)) >= 2e6
     div, suffix = (1e6, "M") if big else (1e3, "k")
     axis.set_major_formatter(matplotlib.ticker.FuncFormatter(
@@ -248,7 +248,7 @@ def page_chip_maps(pdf, chambers, ctx):
     m = chip_map(ax, e, chambers, ctx, cmap="viridis",
                  norm=TwoSlopeNorm(vcenter=0, vmin=min(lo, -0.05 * hi), vmax=hi),
                  title="Expression (GFP)", shows=ctx.gfp_label)
-    mark_floor(bar_below(m, lefts[0], h, label="counts"), ctx.floor, big)
+    mark_floor(bar_below(m, lefts[0], h, label="RFU"), ctx.floor, big)
 
     kind = pd.Series(floor_kind(chambers), index=chambers.index)
     codes = {k: i for i, k in enumerate(FLOOR_MAP)}
@@ -256,7 +256,7 @@ def page_chip_maps(pdf, chambers, ctx):
     chip_map(ax, grid(chambers.assign(code=kind.map(codes)), "code", ctx), chambers, ctx,
              cmap=ListedColormap([c for c, _ in FLOOR_MAP.values()]),
              norm=BoundaryNorm(np.arange(len(FLOOR_MAP) + 1) - 0.5, len(FLOOR_MAP)),
-             title="GFP relative to floor", shows=f"floor: {ctx.floor:,.0f} counts")
+             title="GFP relative to floor", shows=f"floor: {ctx.floor:,.0f} RFU")
     counts = kind.value_counts()
     ax.legend(handles=[plt.Rectangle((0, 0), 1, 1, fc=c, ec="0.3", lw=0.5,
                                      label=textwrap.fill(f"{l} ({counts.get(k, 0):,})", 32))
@@ -296,7 +296,7 @@ def page_chip_maps(pdf, chambers, ctx):
     note = ("Light gray on the K$_m$ and v$_{max}$ / GFP maps: chamber not analyzed. Red chambers on "
             "the GFP floor map belong to variants whose chambers are all below the GFP floor (the "
             "BLANK chambers, triangles, are colored by their own GFP). No GFP standard curve has "
-            "been applied: GFP is in camera counts, not enzyme concentration. K$_m$ and v$_{max}$ / "
+            "been applied: GFP is in RFU, not enzyme concentration. K$_m$ and v$_{max}$ / "
             "GFP are the values used in the volcano plots: K$_m$ clipped to the [S] range, and "
             "v$_{max}$ / GFP replaced by the rate / GFP at the highest [S] where K$_m$ exceeds it.")
     fig.text(GRID["left"] / PAGE[0], 0.04, textwrap.fill(note, 200), fontsize=7.5, color="0.35", va="bottom")
@@ -472,10 +472,19 @@ def mini_volcano(ax, q, table, ctx):
                    alpha=0.9, zorder=2 + row.significant)
     ax.axhline(-np.log10(ctx.p_significant), color="0.3", ls="--", lw=0.8)
     ax.axvline(0, color="0.6", lw=0.6)
+    line = table.attrs.get("reference_line")
+    if line is not None:   # e.g. another chip's WT Km, marked only
+        x_line = np.log2(line["value"] / table["reference_median"].iloc[0])
+        ax.axvline(x_line, color="#B9770E", lw=1.1, ls="--")
+        ax.annotate(f"{line['name']}" + (" (PLACEHOLDER)" if line.get("placeholder") else ""), (x_line, 1.0),
+                    xycoords=("data", "axes fraction"), xytext=(3, -3), textcoords="offset points",
+                    va="top", fontsize=7, color="#B9770E", weight="bold")
     lim = np.ceil(t["log2_fc"].abs().max()) + 0.3
     ax.set_xlim(-lim, lim)
     ax.set_ylim(0, max(t["neg_log10_p"].max(), 2.0) * 1.15)
-    ax.set_xlabel(f"log$_2$ fold change in {q.label}\n(vs {ctx.ref_text})")
+    ref = table["reference"].iloc[0]   # this quantity's own (a fixed one for Km, say)
+    placeholder = bool(table.get("reference_placeholder", pd.Series([False])).iloc[0])
+    ax.set_xlabel(f"log$_2$ fold change in {q.label}\n(vs {ref}{', PLACEHOLDER' if placeholder else ''})")
     fig = ax.figure
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
@@ -513,13 +522,16 @@ def page_summary(pdf, chambers, tables, qs, ctx):
         km_t, vm_t = tables["km"], tables["vmax"]
         wt = chambers[(chambers["tag"] == "WT") & analyzed]
         ref_km = km_t["reference_median"].iloc[0]
+        placeholder = bool(km_t.get("reference_placeholder", pd.Series([False])).iloc[0])
+        ref_note = ("" if ctx.reference == "WT" else " (library)" if ctx.reference == "library median"
+                    else f" ({ctx.reference}{', PLACEHOLDER' if placeholder else ''})")
         rows = [
             ["chambers with DNA", f"{int((chambers['tag'] != 'BLANK').sum()):,}"],
             ["GFP above the floor", f"{int((~chambers['status'].isin(['BLANK', 'below floor'])).sum()):,}"],
             [f"MM fit r² ≥ {ctx.min_r2:g}", f"{int(analyzed.sum()):,}"],
             ["variants, ≥ 2 analyzed", f"{int((per_variant >= 2).sum())} of {chambers.loc[library, 'tag'].nunique()}"],
             [f"median {ctx.km_label} (µM)", f"{np.nanmedian(chambers.loc[analyzed, 'km']):,.0f}"],
-            [f"reference {ctx.km_label} (µM)", f"{ref_km:,.0f}" + ("" if ctx.reference == "WT" else " (library)")],
+            [f"reference {ctx.km_label} (µM)", f"{ref_km:,.0f}" + ref_note],
             [f"{ctx.km_label} hits (p < {ctx.p_significant:g})",
              f"{int(km_t['significant'].sum())} of {int(km_t['tested'].sum())}"],
             [f"{ctx.vmax_label} hits (p < {ctx.p_significant:g})",
@@ -532,9 +544,11 @@ def page_summary(pdf, chambers, tables, qs, ctx):
         ax = box(fig, grid_col(0), top_a, span(0, 1), row_h * (len(rows) + 1))
         _grid_table(ax, ["summary", ""], rows, label_cols=(0,), col_widths=[0.62, 0.38], fills=fills, size=10.5)
         big = np.nanmax(np.abs(chambers["gfp"])) >= 2e6
-        note = (f"GFP floor: {counts_text(ctx.floor, big)} counts\n".replace("-", "−")
+        note = (f"GFP floor: {counts_text(ctx.floor, big)} RFU\n".replace("-", "−")
                 + f"[S]: {ctx.s_range[0]:g}–{ctx.s_range[1]:,.0f} µM; rates in {ctx.rate_unit}")
-        if ctx.reference != "WT":
+        if placeholder:
+            note += (f"\nAmber: the {ctx.km_label} reference is a PLACEHOLDER\n({ctx.reference}, not measured on this chip).")
+        elif ctx.reference != "WT":
             note += "\nAmber: too few WT chambers; fold changes\nare vs the library median."
         ax.annotate(note, (0, 0), xycoords="axes fraction", xytext=(0, -3), textcoords="offset points",
                     va="top", fontsize=9, color="0.45")
@@ -550,7 +564,7 @@ def page_summary(pdf, chambers, tables, qs, ctx):
         v_lo, v_hi = np.nanpercentile(vm, [2, 98]) if np.isfinite(vm).any() else (1e-9, 1)
         specs = [
             ("Expression (GFP)", ctx.gfp_label, e, "viridis",
-             TwoSlopeNorm(vcenter=0, vmin=min(lo, -0.05 * hi), vmax=hi), "counts"),
+             TwoSlopeNorm(vcenter=0, vmin=min(lo, -0.05 * hi), vmax=hi), "RFU"),
             ("MM fit", "per chamber, raw rates", grid(chambers.assign(code=chambers["status"].map(codes)), "code", ctx),
              ListedColormap([c for c, _ in status.values()]),
              BoundaryNorm(np.arange(len(status) + 1) - 0.5, len(status)), ""),
