@@ -48,7 +48,7 @@ import zarr
 from basicpy import BaSiC
 from scipy import ndimage
 
-CAMERA_DARK = 80  # Kinetix offset (counts), subtracted before fitting. Measured 2026-10-09
+CAMERA_DARK = 80  # Kinetix offset (RFU), subtracted before fitting. Measured 2026-10-09
 #                   from the GFP scans at 500 and 1,000 ms (same tiles, same chip): if signal
 #                   scales with exposure, offset = 2 x I(500 ms) - I(1,000 ms); median over
 #                   the 25 tiles 79 counts (interquartile 77-83).
@@ -58,15 +58,24 @@ SMOOTH_PX = 150   # Gaussian smoothing of F (full-tile px): the shading is smoot
 #                   they don't average out completely)
 
 
-def read_tiles(folder, camera_dark=CAMERA_DARK):
+def read_tiles(folder, camera_dark=CAMERA_DARK, channel=None):
     """Every acquired camera tile of one acquisition, averaged down, as (n_tiles, y, x)
     float32, and the number of all-zero tiles left out. `folder` is the group holding 'tile',
-    or the acquisition folder with one such group inside."""
+    or the acquisition folder with one such group inside. `channel` (e.g. "cy5") keeps one
+    channel of an acquisition with a 'channel' dim."""
     group = folder if (folder / "tile").exists() else next(p for p in folder.iterdir() if (p / "tile").exists())
-    tile = zarr.open_group(str(group), mode="r")["tile"]
+    root = zarr.open_group(str(group), mode="r")
+    tile = root["tile"]
     *lead, h, w = tile.shape
+    keep = None  # (axis, index) of the channel kept, if any
+    if channel is not None:
+        dims = list(tile.metadata.dimension_names)
+        names = [str(v) for v in root["channel"][:]]
+        keep = (dims.index("channel"), names.index(channel))
     out, empty = [], 0
     for idx in np.ndindex(*lead):  # one tile in memory at a time
+        if keep is not None and idx[keep[0]] != keep[1]:
+            continue
         raw = np.asarray(tile[idx], np.float32)
         if not raw.any():          # never acquired (a timecourse's unused frames)
             empty += 1
@@ -76,23 +85,26 @@ def read_tiles(folder, camera_dark=CAMERA_DARK):
     return np.stack(out), (h, w), empty
 
 
-def fit(src, out, camera_dark=CAMERA_DARK):
-    stack, shape, empty = read_tiles(src, camera_dark)
+def fit(src, out, camera_dark=CAMERA_DARK, channel=None):
+    stack, shape, empty = read_tiles(src, camera_dark, channel)
     basic = BaSiC(get_darkfield=False)
     basic.fit(stack)
     small = np.asarray(basic.flatfield, np.float32)
     small = ndimage.gaussian_filter(small, SMOOTH_PX / DOWNSAMPLE, mode="nearest")
     flat = ndimage.zoom(small, DOWNSAMPLE, order=3).astype(np.float32)[: shape[0], : shape[1]]
     flat /= flat.mean()  # mean 1: correcting keeps the overall intensity
+    h, w = flat.shape
     out.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(out.with_suffix(".tif"), flat)
     stats = dict(
         method="BaSiC (basicpy 2.0.0), over every acquired tile of one acquisition",
-        source=str(src), n_tiles=len(stack), empty_tiles_left_out=empty, downsample=DOWNSAMPLE,
+        source=str(src), channel=channel, n_tiles=len(stack), empty_tiles_left_out=empty, downsample=DOWNSAMPLE,
         smooth_px=SMOOTH_PX, camera_dark_counts=camera_dark,
         get_darkfield=False, flatfield_min=float(flat.min()), flatfield_max=float(flat.max()),
         flatfield_p1_p99=[float(v) for v in np.percentile(flat, [1, 99])],
-        corner_over_center=float(flat[:200, :200].mean() / flat[1500:1700, 1500:1700].mean()),
+        # the corner and center 1/16 of the tile on a side (200 px on the Kinetix's 3,200)
+        corner_over_center=float(flat[: h // 16, : w // 16].mean()
+                                 / flat[h // 2 - h // 32 : h // 2 + h // 32, w // 2 - w // 32 : w // 2 + w // 32].mean()),
     )
     out.with_suffix(".json").write_text(json.dumps(stats, indent=2) + "\n")
     print(f"{len(stack)} tiles ({empty} empty left out); F {stats['flatfield_min']:.2f}-"
@@ -101,7 +113,8 @@ def fit(src, out, camera_dark=CAMERA_DARK):
 
 def main():
     src, out = (Path(a) for a in sys.argv[1:3])
-    fit(src, out, float(sys.argv[3]) if len(sys.argv) > 3 else CAMERA_DARK)
+    fit(src, out, float(sys.argv[3]) if len(sys.argv) > 3 else CAMERA_DARK,
+        sys.argv[4] if len(sys.argv) > 4 else None)
 
 
 if __name__ == "__main__":

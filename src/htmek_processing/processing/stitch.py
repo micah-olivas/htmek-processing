@@ -20,12 +20,17 @@ from .io import load_image
 # imaged at different times; chamber_seconds() recovers each chamber's own time.
 
 
-def open_tiled(path):
+def open_tiled(path, channel=None):
     """Open a tiled acquisition as a lazy xarray Dataset (nothing is read until indexed).
 
     `path` is the zarr group holding 'tile', or the acquisition folder containing it --
     the group's name varies ('tiled_images', 'egfp_500ms', ...), so it is found by looking
-    for the one subfolder with a 'tile' array."""
+    for the one subfolder with a 'tile' array.
+
+    An acquisition of several channels at every tile (a 'channel' dim, e.g. prismo's
+    tiled_kinetics: "cy5", "gfp") needs `channel`, which selects one. Passes a timecourse
+    never acquired (NaN 'pass_start_s': the run stopped before its last planned pass) are
+    dropped, so they are never stitched."""
     import xarray as xr
 
     path = Path(path)
@@ -37,7 +42,18 @@ def open_tiled(path):
                 f"found {[g.name for g in groups]}"
             )
         path = groups[0]
-    return xr.open_zarr(path, consolidated=False)
+    ds = xr.open_zarr(path, consolidated=False)
+    if "channel" in ds.dims:
+        if channel is None:
+            raise ValueError(f"{path} holds channels {list(ds['channel'].values)}: pass channel=")
+        ds = ds.sel(channel=channel, drop=True)
+    elif channel is not None:
+        raise ValueError(f"{path} has no channel dim; got channel={channel!r}")
+    if "pass_start_s" in ds and "time" in ds["pass_start_s"].dims:
+        acquired = np.isfinite(ds["pass_start_s"].values)
+        if not acquired.all():
+            ds = ds.isel(time=np.flatnonzero(acquired))
+    return ds
 
 
 def overlap_px(tiled, overlap=None):
@@ -91,7 +107,7 @@ def stitch_tiles(tiles, overlap, split=False):
     return np.concatenate(rows, axis=-2)
 
 
-def measure_tile_overlaps(src, *, rotation_deg=0.0, frame=0, overlap=None, band=300, smooth=20):
+def measure_tile_overlaps(src, *, rotation_deg=0.0, frame=0, overlap=None, band=300, smooth=20, channel=None):
     """The overlap between neighboring tiles of a tiled acquisition, gap by gap, measured on
     the chip itself: each pair of neighbors' overlap strips (trailing strip of one, leading
     strip of the next, at the nominal overlap) are registered by phase correlation, after
@@ -104,13 +120,14 @@ def measure_tile_overlaps(src, *, rotation_deg=0.0, frame=0, overlap=None, band=
       cross_dy / cross_dx     the leftover offset across the seams (px): sideways for
                               left-right neighbors (dy) and up-down ones (dx); near 0 when the
                               rotation is right;
-      spread_y / spread_x     the SD over the other axis (px), how repeatable each gap is."""
+      spread_y / spread_x     the SD over the other axis (px), how repeatable each gap is.
+    `channel` picks one channel of a multi-channel acquisition (open_tiled)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from scipy import ndimage
     from skimage.registration import phase_cross_correlation
 
-    tiled = open_tiled(src)
+    tiled = open_tiled(src, channel)
     ov = overlap_px(tiled, overlap)
     tiles = tiled["tile"].squeeze([d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] == 1])
     if tiles.ndim == 5:
@@ -158,6 +175,7 @@ def stitch_to_zarr(
     rotation_deg=0.0,
     offset=0.0,
     overwrite=False,
+    channel=None,
 ):
     """Stitch a tiled acquisition and save it as a zarr store at `dst`.
 
@@ -184,7 +202,7 @@ def stitch_to_zarr(
     tile row's and column's origin in the stitched image (attrs tile_y0, tile_x0) and where
     the tiles meet (attrs seams_y, seams_x).
 
-    `offset` (counts) is the camera's offset, subtracted from every tile first: use it with a
+    `offset` (RFU) is the camera's offset, subtracted from every tile first: use it with a
     flatfield scaled to mean 1 (e.g. BaSiC's), which has no offset of its own. (`darkfield` is
     the offset inside a raw flatfield image, see flatfield_correct.)
 
@@ -196,7 +214,9 @@ def stitch_to_zarr(
 
     Returns the stitched store as a lazy xarray Dataset. If `dst` already holds a finished
     stitch it is reopened instead of rebuilt, unless `overwrite=True`. A store left
-    half-written by an interrupted run is marked unfinished and is rebuilt."""
+    half-written by an interrupted run is marked unfinished and is rebuilt. `channel` picks
+    one channel of a multi-channel acquisition (open_tiled). Tiles never acquired (no time
+    in 'seconds', e.g. the rest of a pass the run stopped in) are NaN in a float store."""
     import dask.array as da
     import xarray as xr
     import zarr
@@ -209,7 +229,7 @@ def stitch_to_zarr(
             return done
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tiled = open_tiled(src)
+    tiled = open_tiled(src, channel)
     singleton = [d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] == 1]
     tiles = tiled["tile"].squeeze(singleton)
     seconds = tiled["seconds"].squeeze(
@@ -305,12 +325,19 @@ def stitch_to_zarr(
                 for row in frame
             ])
             frame = (frame if np.issubdtype(dtype, np.floating) else np.rint(frame)).astype(dtype)
+        # tiles of a pass the run stopped in the middle of were never acquired (no time):
+        # NaN in a float store, not a dark tile
+        times = seconds[dict(zip(lead, idx))].values if lead else seconds.values
+        missing = ~np.isfinite(np.asarray(times, float))
+        if missing.any() and np.issubdtype(dtype, np.floating):
+            frame = frame.astype(dtype, copy=True)
+            frame[missing] = np.nan
         out[idx] = stitch_tiles(frame, ov, split=split)
     zarr.open_group(dst, mode="r+").attrs["stitch_complete"] = True
     return xr.open_zarr(dst, consolidated=False)
 
 
-def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0):
+def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0, channel=None):
     """The seam geometry of a tiled acquisition, measured once and kept: measure_tile_overlaps
     on `frame` (default the last; a textured frame fits best), saved to `path` (JSON) with what
     it was measured on, and read back from there on later runs (delete it to measure again).
@@ -324,12 +351,13 @@ def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0):
 
     path = Path(path)
     if not path.exists():
-        tiled = open_tiled(src)
+        tiled = open_tiled(src, channel)
         lead = [d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] > 1]
         n = tiled.sizes[lead[0]] if lead else 1
         k = frame % n
-        geometry = measure_tile_overlaps(src, rotation_deg=rotation_deg, frame=k)
-        geometry.update(measured_on=f"{Path(src).name}, frame {k}", rotation_deg=rotation_deg)
+        geometry = measure_tile_overlaps(src, rotation_deg=rotation_deg, frame=k, channel=channel)
+        on = Path(src).name + (f" ({channel})" if channel else "")
+        geometry.update(measured_on=f"{on}, frame {k}", rotation_deg=rotation_deg)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(geometry, indent=1))
     geometry = json.loads(path.read_text())
@@ -340,23 +368,26 @@ def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0):
     return geometry
 
 
-def fit_flatfield(src, path, *, camera_offset=80.0):
+def fit_flatfield(src, path, *, camera_offset=80.0, channel=None):
     """The BaSiC pseudo flatfield of one acquisition (one camera tile, mean 1), fitted from
     its own tiles by the package's fit_flatfield.py in a throwaway uv environment (basicpy
     needs its own pins), unless `path` (.tif, with a .json of stats beside it) exists.
-    `camera_offset` (counts) is subtracted from the tiles first. Returns `path`."""
+    `camera_offset` (RFU) is subtracted from the tiles first; `channel` picks one channel of a
+    multi-channel acquisition. Returns `path`."""
     import os
     import subprocess
 
     path = Path(path)
     if not path.exists():
         script = Path(__file__).with_name("fit_flatfield.py")
-        subprocess.run(["uv", "run", str(script), str(src), str(path), str(camera_offset)],
+        subprocess.run(["uv", "run", str(script), str(src), str(path), str(camera_offset),
+                        *([channel] if channel else [])],
                        check=True, env={**os.environ, "PYTHONNOUSERSITE": "1"})
     return path
 
 
-def stitch_run(src, dst, *, camera, geometry_path, flatfield_path, seam_frame=-1, max_cross_px=3.0):
+def stitch_run(src, dst, *, camera, geometry_path, flatfield_path, seam_frame=-1, max_cross_px=3.0,
+               channel=None):
     """The standard way in for a tiled acquisition (an assay's kinetic run, a GFP or Cy5 scan):
     seams measured or reused (stitch_geometry), flatfield fitted or reused (fit_flatfield),
     then flatfield-corrected, rotated and stitched to the zarr store `dst` (stitch_to_zarr;
@@ -365,15 +396,28 @@ def stitch_run(src, dst, *, camera, geometry_path, flatfield_path, seam_frame=-1
     Returns a dict: image (the lazy (time, y, x) or (y, x) stitched image), store (the
     stitched dataset, with its attrs: seams_y / seams_x, tile_px, ...), tiled (the raw
     acquisition, with its attrs: substrate, filter, camera, start_time, ...), geometry, and
-    pass_s (each frame's first tile, in s since the run started; None for a snapshot)."""
+    pass_s (each frame's first tile, in s since the run started; None for a snapshot).
+    `channel` picks one channel of a multi-channel acquisition (each channel gets its own
+    flatfield and store; the seams can be measured on either and reused)."""
     geometry = stitch_geometry(src, geometry_path, rotation_deg=camera["rotation_deg"],
-                               frame=seam_frame, max_cross_px=max_cross_px)
-    flat = fit_flatfield(src, flatfield_path, camera_offset=camera["offset"])
+                               frame=seam_frame, max_cross_px=max_cross_px, channel=channel)
+    flat = fit_flatfield(src, flatfield_path, camera_offset=camera["offset"], channel=channel)
     store = stitch_to_zarr(src, dst, flatfield=flat, offset=camera["offset"],
-                           rotation_deg=camera["rotation_deg"], overlap=geometry)
-    tiled = open_tiled(src)
+                           rotation_deg=camera["rotation_deg"], overlap=geometry, channel=channel)
+    tiled = open_tiled(src, channel)
     seconds = tiled["seconds"].values
     pass_s = np.nanmin(seconds.reshape(seconds.shape[0], -1), axis=1) if seconds.ndim == 3 else None
+    from ..analysis.steps import tally_step
+
+    own = Path(src).name in Path(geometry_path).stem
+    tally_step("stitch_run", "Stitch tile scans",
+               ["per acquisition: BaSiC flatfield, camera offset",
+                f"subtracted, rotated {camera['rotation_deg']:g}°, tiles joined at",
+                f"measured seams (≤ {max_cross_px:g} px off across a seam)",
+                "a dim scan reuses a bright scan's seams"],
+               Path(src).name + (f" ({channel})" if channel else ""),
+               label="seams measured on itself" if own else "seams from another scan",
+               level="pass" if own else "info", unit="acquisitions")
     return dict(image=store["image"], store=store, tiled=tiled, geometry=geometry, pass_s=pass_s)
 
 

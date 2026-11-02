@@ -119,14 +119,14 @@ def test_grid_adjuster_key_panel_fits_and_clears_the_sliders(adjuster):
 def test_stitch_geometry_measures_once_and_checks_the_seams(tmp_path, monkeypatch):
     calls = []
 
-    def fake_measure(src, *, rotation_deg, frame):
+    def fake_measure(src, *, rotation_deg, frame, channel=None):
         calls.append(frame)
         return dict(overlap_y=[300.0], overlap_x=[301.0], cross_dy=0.2, cross_dx=-0.4,
                     spread_y=[0.1], spread_x=[0.2])
 
     tiled = xr.Dataset({"tile": (("time", "row", "col", "y", "x"), np.zeros((5, 2, 2, 4, 4)))})
     monkeypatch.setattr(stitch, "measure_tile_overlaps", fake_measure)
-    monkeypatch.setattr(stitch, "open_tiled", lambda src: tiled)
+    monkeypatch.setattr(stitch, "open_tiled", lambda src, channel=None: tiled)
     g = hp.stitch_geometry("run", tmp_path / "g.json", rotation_deg=-2.15)
     assert calls == [4]                      # the last frame
     assert g["overlap_x"] == [301.0] and g["rotation_deg"] == -2.15
@@ -249,3 +249,17 @@ def test_fit_progress_curves_keys_bleach_fits_by_the_run_value():
     out, rates = hp.fit_progress_curves(traces, "median", per=("s_uM", "mark_row", "mark_col"), n_jobs=1)
     assert set(out.attrs["bleach_fit"]) == {5000.0, 1000.0}
     assert len(rates) == 2 * 8
+
+
+def test_open_tiled_picks_a_channel_and_drops_unacquired_passes(tmp_path):
+    from htmek_processing.processing.stitch import open_tiled
+
+    ds = xr.Dataset(
+        {"tile": (("time", "channel", "row", "col", "y", "x"), np.ones((4, 2, 1, 1, 2, 2), np.uint16)),
+         "pass_start_s": (("time",), np.array([0.0, 450.0, np.nan, np.nan]))},
+        coords={"channel": ["cy5", "gfp"]})
+    ds.to_zarr(tmp_path / "kinetics", consolidated=False)
+    out = open_tiled(tmp_path / "kinetics", channel="gfp")
+    assert "channel" not in out.dims and out.sizes["time"] == 2
+    with pytest.raises(ValueError):
+        open_tiled(tmp_path / "kinetics")
