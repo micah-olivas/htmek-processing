@@ -56,3 +56,17 @@ def test_chamber_outside_button_skips_the_off_center_button():
     run, _ = hp.chamber_outside_button(np.stack([img, img * 2]), np.array([[100.0]]), np.array([[100.0]]),
                                        np.array([[92.0]]), np.array([[95.0]]), chamber_radius=37, button_radius=14)
     assert run.shape == (2, 1, 1) and run[1, 0, 0] == 100.0
+
+
+def test_center_on_disc_sum_centers_a_wristwatch_chamber_beside_a_channel():
+    cx, cy = _grid()
+    img = np.random.default_rng(1).normal(50, 2, (480, 480)).astype(np.float32)
+    yy, xx = np.mgrid[:480, :480]
+    true_x, true_y = cx + 6, cy - 5
+    for x, y in zip(true_x.ravel(), true_y.ravel()):
+        face = (np.hypot(xx - x, yy - y) <= 37) | ((np.abs(xx - x) <= 28) & (np.abs(yy - y) <= 44))  # watch face
+        img[face] = 200
+        img[(xx > x + 37) & (xx <= x + 60) & (np.abs(yy - y) <= 12)] = 150     # a bright side channel
+    sx, sy, matched = hp.center_on_disc_sum(img, cx, cy, 35)
+    assert matched.all()
+    assert np.allclose(sx, true_x, atol=1.0) and np.allclose(sy, true_y, atol=1.0)

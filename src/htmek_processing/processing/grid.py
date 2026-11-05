@@ -513,3 +513,93 @@ def load_centers(path):
     t = pd.read_csv(path).sort_values(["mark_row", "mark_col"])
     shape = (t["mark_row"].max() + 1, t["mark_col"].max() + 1)
     return t["x"].to_numpy().reshape(shape), t["y"].to_numpy().reshape(shape)
+
+
+def center_on_disc_sum(image, cx, cy, radius, *, reach=16, frac=0.995, smooth=1.0, ring=0):
+    """Move each grid point to where a disc of `radius` px holds the most signal, searched within `reach` px of the
+    grid point. The disc sum is computed at every offset (one convolution), and the point moves to the middle of the
+    connected region within `frac` of the window's maximum; a chamber longer than the disc in one direction (the
+    reaction chamber's wristwatch face, MBO-054) has a flat ridge there, and the middle of the ridge centers it.
+    With `ring` > 0 the score is the disc mean minus the mean of a `ring`-px annulus just outside it, so a disc
+    that spills onto a bright neighbor (a side channel, the next chamber) loses score. A point whose maximum lies on
+    the edge of the window keeps the grid position.
+
+    Returns (sx, sy, matched)."""
+    from scipy import ndimage, signal
+
+    img = ndimage.gaussian_filter(np.nan_to_num(np.asarray(image, np.float32)), smooth)
+    r = int(np.ceil(radius + ring))
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    rr = np.hypot(xx, yy)
+    kernel = (rr <= radius) / (rr <= radius).sum()
+    if ring:
+        annulus = (rr > radius) & (rr <= radius + ring)
+        kernel = kernel - annulus / annulus.sum()
+    total = signal.fftconvolve(img, kernel.astype(np.float32), mode="same")
+    sx, sy = np.array(cx, float), np.array(cy, float)
+    matched = np.zeros(sx.shape, bool)
+    for idx in np.ndindex(sx.shape):
+        x0, y0 = int(round(sx[idx])), int(round(sy[idx]))
+        w = total[max(y0 - reach, 0):y0 + reach + 1, max(x0 - reach, 0):x0 + reach + 1]
+        if w.shape != (2 * reach + 1, 2 * reach + 1):
+            continue
+        py, px = np.unravel_index(np.argmax(w), w.shape)
+        if not (0 < py < 2 * reach and 0 < px < 2 * reach):
+            continue
+        lab, _ = ndimage.label(w >= w.min() + frac * (w.max() - w.min()))
+        my, mx = ndimage.center_of_mass(lab == lab[py, px])
+        sx[idx], sy[idx] = x0 - reach + mx, y0 - reach + my
+        matched[idx] = True
+    return sx, sy, matched
+
+
+def center_on_template(image, cx, cy, *, half, reach=12, n_iter=2, min_score=0.5, smooth=1.0):
+    """Move each grid point onto its chamber by matching a template of the chamber's own shape, e.g. the reaction
+    chamber's wristwatch face (round on the sides, squared and extended top and bottom), which a circle fit
+    centers poorly (MBO-054). The template is the median of every chamber's crop (`half` px either side), rebuilt
+    `n_iter` times from the re-centered crops; each point then moves to the normalized cross-correlation peak
+    within `reach` px (sub-pixel). A point moves only when its peak score is >= `min_score` and not at the edge of
+    the search; the rest can take their neighbors' shift (shift_from_neighbors). The template is built from crops at
+    the grid points, so it keeps the grid's offset (about 5 px left on MBO-054); center_on_disc_sum does not.
+
+    Returns (sx, sy, matched, score, template)."""
+    from scipy import ndimage
+    from skimage.feature import match_template
+
+    img = ndimage.gaussian_filter(np.nan_to_num(np.asarray(image, np.float32)), smooth)
+    sx, sy = np.array(cx, float), np.array(cy, float)
+    big = half + reach
+
+    def crop(x, y, h):
+        x0, y0 = int(round(x)), int(round(y))
+        if y0 - h < 0 or x0 - h < 0 or y0 + h + 1 > img.shape[0] or x0 + h + 1 > img.shape[1]:
+            return None
+        sub = ndimage.shift(img[y0 - h - 1:y0 + h + 2, x0 - h - 1:x0 + h + 2], (y0 - y, x0 - x), order=1)
+        return sub[1:-1, 1:-1]
+
+    def vertex(a, b, c):
+        den = a - 2 * b + c
+        return 0.0 if den == 0 or not np.isfinite(den) else float(np.clip(0.5 * (a - c) / den, -0.5, 0.5))
+
+    matched = np.zeros(sx.shape, bool)
+    score = np.full(sx.shape, np.nan)
+    template = None
+    for _ in range(n_iter + 1):
+        crops = [c for c in (crop(sx[i], sy[i], half) for i in np.ndindex(sx.shape)) if c is not None]
+        template = np.median(np.stack(crops), axis=0)
+        nx, ny = np.array(cx, float), np.array(cy, float)
+        matched[:] = False
+        for idx in np.ndindex(sx.shape):
+            window = crop(cx[idx], cy[idx], big)   # always searched from the grid point
+            if window is None:
+                continue
+            ncc = match_template(window, template)          # (2 reach + 1)^2 offsets
+            py, px = np.unravel_index(np.argmax(ncc), ncc.shape)
+            score[idx] = ncc[py, px]
+            if score[idx] < min_score or not (0 < py < ncc.shape[0] - 1 and 0 < px < ncc.shape[1] - 1):
+                continue
+            nx[idx] = cx[idx] + px - reach + vertex(ncc[py, px - 1], ncc[py, px], ncc[py, px + 1])
+            ny[idx] = cy[idx] + py - reach + vertex(ncc[py - 1, px], ncc[py, px], ncc[py + 1, px])
+            matched[idx] = True
+        sx, sy = nx, ny
+    return sx, sy, matched, score, template
