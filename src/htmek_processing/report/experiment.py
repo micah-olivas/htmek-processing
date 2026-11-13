@@ -24,6 +24,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.dates
+import matplotlib.patches
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm, TwoSlopeNorm
@@ -648,10 +650,85 @@ def page_summary(pdf, chambers, tables, qs, ctx):
         plt.close(fig)
 
 
+STEP_COLORS = {"purge": "#BDBDBD", "wash": "#9ECAE1", "closed": "#FDD0A2", "open": "#E6550D", "other": "#74A9CF"}
+
+
+def step_kind(step):
+    """A protocol step's kind, for its color: purge, wash, buttons closed / open, or other (a reagent step)."""
+    s = step.lower()
+    return ("purge" if "purge" in s else "wash" if "wash" in s and "sds" not in s else
+            "closed" if "closed" in s else "open" if "open" in s else "other")
+
+
+def page_protocol(pdf, runs, steps, ctx):
+    """The chip-control protocol log: every completed run as a row of its steps over clock time, one panel per day
+    (stacked), and a table of the runs (start, duration, info, settings)."""
+    done = runs[runs["completed"]].reset_index(drop=True)
+    done["day"] = done["start"].dt.normalize()
+    days = sorted(done["day"].unique())
+    fig = plt.figure(figsize=PAGE)
+    page_frame(fig, ctx, "Protocol log")
+    W, H = PAGE
+    left, width = GRID["left"] + 2.3, W - GRID["left"] - 2.3 - 0.5
+    top = 0.95
+    for d in days:
+        part = done[done["day"] == d]
+        sub = steps[steps["run"].isin(part["run"])]
+        h = 0.34 * len(part) + 0.25
+        ax = box(fig, left, top, width, h)
+        for row, r in enumerate(part.itertuples()):
+            for st in sub[sub["run"] == r.run].itertuples():
+                ax.barh(row, st.seconds / 86400, left=matplotlib.dates.date2num(st.start), height=0.62,
+                        color=STEP_COLORS[step_kind(st.step)], edgecolor="white", lw=0.4)
+        t0, t1 = sub["start"].min(), sub["end"].max()
+        pad = (t1 - t0) * 0.02
+        ax.set_xlim(matplotlib.dates.date2num(t0 - pad), matplotlib.dates.date2num(t1 + pad))
+        ax.set_yticks(range(len(part)), [f"{r.protocol} · {r.start:%H:%M}" for r in part.itertuples()], fontsize=9)
+        ax.set_ylim(len(part) - 0.5, -0.5)
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%H:%M"))
+        ax.tick_params(axis="x", labelsize=8.5)
+        ax.set_title(f"{pd.Timestamp(d):%Y-%m-%d}", loc="left", fontsize=10, pad=3)
+        top += h + 0.65
+    handles = [matplotlib.patches.Patch(color=c, label={"closed": "buttons closed", "open": "buttons open",
+                                                        "other": "reagent / SDS"}.get(k, k))
+               for k, c in STEP_COLORS.items()]
+    fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(1 - 0.5 / W, 1 - 0.6 / H), ncol=5, frameon=False,
+               fontsize=8.5)
+    # the runs as a table, long cells wrapped
+    wrap = lambda text, n: "\n".join(textwrap.wrap(str(text), n)) or ""
+    rows = [[r.protocol, f"{r.start:%Y-%m-%d %H:%M}", f"{r.minutes:.0f} min", wrap(r.info, 38), wrap(r.settings, 70)]
+            for r in done.itertuples()]
+    n_lines = [max(c.count("\n") + 1 for c in row) for row in rows]
+    row_h = 0.17
+    ax = box(fig, GRID["left"], top + 0.1, W - GRID["left"] - 0.5, row_h * (sum(n_lines) + 1.5))
+    ax.axis("off")
+    t = ax.table(cellText=rows, colLabels=["protocol", "start", "duration", "info", "settings"], bbox=(0, 0, 1, 1),
+                 cellLoc="left", colWidths=[0.17, 0.12, 0.07, 0.24, 0.40])
+    t.auto_set_font_size(False); t.set_fontsize(7.5)
+    total = sum(n_lines) + 1.5
+    y = 1.0
+    for row in range(len(rows) + 1):   # rows as tall as their wrapped text
+        hrow = (1.5 if row == 0 else n_lines[row - 1]) / total
+        y -= hrow
+        for col in range(5):
+            cell = t[row, col]
+            cell.set_y(y); cell.set_height(hrow)
+            cell.set_edgecolor("0.8"); cell.set_linewidth(0.5)
+            if row == 0:
+                cell.set_facecolor("#EEF2F7")
+    stopped = int((~runs["completed"]).sum())
+    if stopped:
+        fig.text(GRID["left"] / W, 0.3 / H, f"{stopped} run(s) stopped early and restarted, not shown",
+                 fontsize=8.5, color="0.4")
+    pdf.savefig(fig)
+    plt.close(fig)
+
 def experiment_report_pdf(path, *, gfp, rates, mm_raw, mm_per_gfp, floor, experiment,
                           rate_unit="µM/s", gfp_col="button_sum_minus_bg", gfp_label="button sum",
-                          rate="v0", min_r2=0.9, n_rows=56, n_cols=32, rate_note="", volcano_kw=None):
-    """Write the experiment report (5 pages) to `path`.
+                          rate="v0", min_r2=0.9, n_rows=56, n_cols=32, rate_note="", volcano_kw=None,
+                          protocol_log=None):
+    """Write the experiment report (5 pages, a 6th with `protocol_log`) to `path`.
 
     gfp        one row per chamber: mark_row, mark_col, tag and `gfp_col` (one GFP scan)
     rates      one row per chamber and [S] run (bzp_uM), with `rate` (e.g. fit_progress_curves'
@@ -661,6 +738,8 @@ def experiment_report_pdf(path, *, gfp, rates, mm_raw, mm_per_gfp, floor, experi
     floor      the GFP floor (e.g. volcano.gfp_floor(gfp))
     experiment the text at the top right of every page (library · date)
     volcano_kw settings for volcano.variant_table (reference, min_replicates, ...)
+    protocol_log  a chip-control protocol log (processing.protocol_log.read_protocol_log): adds a page with its
+               completed runs as a timeline and a table
     Returns {"km": table, "vmax": table}, the volcano tables behind the summary page."""
     volcano_kw = dict(volcano_kw or {})
     chambers, vrates, tables, qs, _ = report_tables(gfp, rates, mm_raw, mm_per_gfp, floor=floor,
@@ -680,4 +759,7 @@ def experiment_report_pdf(path, *, gfp, rates, mm_raw, mm_per_gfp, floor, experi
             page_rate_maps(pdf, chambers, vrates, ctx, rate=rate)
             page_position_trends(pdf, chambers, ctx)
             page_distributions(pdf, chambers, ctx)
+            if protocol_log is not None:
+                from ..processing.protocol_log import read_protocol_log
+                page_protocol(pdf, *read_protocol_log(protocol_log), ctx)
     return tables
