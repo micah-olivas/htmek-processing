@@ -110,7 +110,11 @@ class GridAdjuster:
 
     A "How to use" panel left of the image lists the mouse actions and the hotkeys
     (KEY_KEYS): z zoom box, + / − zoom where the mouse is, two-finger scroll pans, h or 0 home, p pan, esc leave
-    zoom / pan, 1-4 the corners. It refits when the window is resized."""
+    zoom / pan, 1-4 the corners. It refits when the window is resized.
+
+    In a desktop window (`%matplotlib qt`) the call blocks until the window is closed (`block=True`,
+    the default), so the next cell only runs once the grid is placed; `block=False` returns at once
+    (then call `wait()` before running on)."""
 
     LABELS = ("TL", "TR", "BR", "BL")
     MAX_DISPLAY_PX = 1024  # longest edge of the VIEW drawn at once (see _render_view)
@@ -138,6 +142,7 @@ class GridAdjuster:
         warp_path=None,
         dark=None,
         dumbbell=None,
+        block=True,
     ):
         # the window's theme: the OS's appearance unless `dark` is given
         self.theme = THEMES["dark" if (os_dark_mode() if dark is None else dark) else "light"]
@@ -209,6 +214,19 @@ class GridAdjuster:
         # saved as soon as the window opens (and after every change), so a later cell always
         # finds the placement, even when only local corrections were made
         self._persist()
+        if block:
+            self.wait()
+
+    def wait(self):
+        """Block until the window is closed, so the next notebook cell cannot run against a window that is
+        still open (with `%matplotlib qt`, running on crashed the kernel; MBO-054, 2026-11-09). Only in a
+        desktop window (Qt, macOS, Tk): with ipympl or a non-interactive backend (e.g. a notebook run by
+        nbconvert) it returns at once."""
+        import matplotlib
+
+        backend = matplotlib.get_backend().lower()
+        if any(k in backend for k in ("qt", "macosx", "tk")) and plt.fignum_exists(self.fig.number):
+            plt.show(block=True)
 
     def _read_frame(self, t):
         """One 2-D frame of the stack as a numpy array (reads just that frame)."""
