@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
+
 import numpy as np
 
 from .io import load_image
@@ -163,6 +165,54 @@ def measure_tile_overlaps(src, *, rotation_deg=0.0, frame=0, overlap=None, band=
     )
 
 
+def _stitch_frame(job):
+    """Stitch one frame of an acquisition into its slot of an existing zarr array (stitch_to_zarr's worker):
+    offset, flatfield or background, rotation, then the tiles butted together."""
+    import zarr
+
+    tiled = open_tiled(job["src"], job["channel"])
+    singleton = [d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] == 1]
+    tiles = tiled["tile"].squeeze(singleton)
+    seconds = tiled["seconds"].squeeze([d for d in singleton if d in tiled["seconds"].dims])
+    lead, idx, dtype = job["lead"], job["idx"], np.dtype(job["dtype"])
+    offset, flatfield, bg_tiles = job["offset"], job["flatfield"], job["bg_tiles"]
+    frame = tiles[dict(zip(lead, idx))].values  # (row, col, y, x)
+    if offset is not None and np.any(offset):   # a scalar, or a per-pixel dark image (one camera tile)
+        frame = frame.astype(np.float32) - np.asarray(offset, np.float32)
+    if flatfield is not None:  # per tile, before the overlap is trimmed
+        frame = flatfield_correct(frame, flatfield, darkfield=job["darkfield"], background=bg_tiles).astype(dtype)
+    elif bg_tiles is not None:  # background only, no flatfield (none available yet)
+        frame = (frame.astype(np.float32) - bg_tiles).astype(dtype)
+    if job["rotation_deg"]:  # square each tile to the stage axes before butting them together
+        from scipy.ndimage import rotate
+
+        frame = np.stack([
+            np.stack([rotate(t.astype(np.float32), job["rotation_deg"], reshape=False, order=1, mode="nearest") for t in row])
+            for row in frame
+        ])
+        frame = (frame if np.issubdtype(dtype, np.floating) else np.rint(frame)).astype(dtype)
+    # tiles of a pass the run stopped in the middle of were never acquired (no time):
+    # NaN in a float store, not a dark tile
+    times = seconds[dict(zip(lead, idx))].values if lead else seconds.values
+    missing = ~np.isfinite(np.asarray(times, float))
+    if missing.any() and np.issubdtype(dtype, np.floating):
+        frame = frame.astype(dtype, copy=True)
+        frame[missing] = np.nan
+    zarr.open_array(job["dst"], mode="r+")[idx] = stitch_tiles(frame, job["ov"], split=job["split"])
+
+
+def _offset_value(offset):
+    """The camera offset as a scalar, or a per-pixel dark image (a 2-D array, or a path to one)."""
+    if offset is None:
+        return 0.0
+    if isinstance(offset, (str, Path)):
+        from .io import load_image
+
+        return load_image(offset).astype(np.float32)
+    a = np.asarray(offset, np.float32)
+    return float(a) if a.ndim == 0 else a
+
+
 def stitch_to_zarr(
     src,
     dst,
@@ -176,6 +226,7 @@ def stitch_to_zarr(
     offset=0.0,
     overwrite=False,
     channel=None,
+    n_jobs=None,
 ):
     """Stitch a tiled acquisition and save it as a zarr store at `dst`.
 
@@ -202,7 +253,8 @@ def stitch_to_zarr(
     tile row's and column's origin in the stitched image (attrs tile_y0, tile_x0) and where
     the tiles meet (attrs seams_y, seams_x).
 
-    `offset` (RFU) is the camera's offset, subtracted from every tile first: use it with a
+    `offset` (RFU) is the camera's offset, subtracted from every tile first: a scalar, or a per-pixel dark
+    image the size of one camera tile (array or path; e.g. MBO-053's measured darks). Use it with a
     flatfield scaled to mean 1 (e.g. BaSiC's), which has no offset of its own. (`darkfield` is
     the offset inside a raw flatfield image, see flatfield_correct.)
 
@@ -216,7 +268,9 @@ def stitch_to_zarr(
     stitch it is reopened instead of rebuilt, unless `overwrite=True`. A store left
     half-written by an interrupted run is marked unfinished and is rebuilt. `channel` picks
     one channel of a multi-channel acquisition (open_tiled). Tiles never acquired (no time
-    in 'seconds', e.g. the rest of a pass the run stopped in) are NaN in a float store."""
+    in 'seconds', e.g. the rest of a pass the run stopped in) are NaN in a float store. Frames
+    are stitched in parallel across `n_jobs` processes (default half the cores, at most 6; each
+    holds one frame, ~2 GB for 25 Kinetix tiles); 1 = serial."""
     import dask.array as da
     import xarray as xr
     import zarr
@@ -257,7 +311,9 @@ def stitch_to_zarr(
     step = int(round(height / R)), int(round(width / C))  # mean stitched tile pitch (y, x)
 
     # lay out the store (metadata only, nothing computed), then fill it frame by frame
-    corrected = flatfield is not None or background is not None or bool(offset)
+    offset_src = offset if isinstance(offset, (str, Path)) else None
+    offset = _offset_value(offset)
+    corrected = flatfield is not None or background is not None or bool(np.any(offset))
     dtype = np.float32 if corrected else tiles.dtype
     image = xr.DataArray(
         da.zeros(
@@ -285,8 +341,11 @@ def stitch_to_zarr(
         )
     if rotation_deg:
         ds.attrs["rotation_deg"] = float(rotation_deg)
-    if offset:
+    if np.ndim(offset) == 0 and offset:
         ds.attrs["offset"] = float(offset)
+    elif np.ndim(offset) == 2:   # a dark image: its median, and where it came from
+        ds.attrs["offset"] = float(np.median(offset))
+        ds.attrs["offset_image"] = str(offset_src) if offset_src is not None else "array"
     ds.attrs["stitch_complete"] = False  # flipped only once every frame is written
     ds.to_zarr(dst, mode="w", compute=False, consolidated=False)
 
@@ -305,41 +364,27 @@ def stitch_to_zarr(
                 bg_tiles, (0, 0, *background_shift), order=1, mode="nearest"
             )
 
-    out = zarr.open_array(dst / "image", mode="r+")
-    for idx in np.ndindex(*lead_shape):  # a single empty index for a snapshot
-        frame = tiles[dict(zip(lead, idx))].values  # (row, col, y, x)
-        if offset:
-            frame = frame.astype(np.float32) - np.float32(offset)
-        if flatfield is not None:  # per tile, before the overlap is trimmed
-            frame = flatfield_correct(
-                frame, flatfield, darkfield=darkfield, background=bg_tiles
-            ).astype(dtype)
-        elif bg_tiles is not None:  # background only, no flatfield (none available yet)
-            frame = (frame.astype(np.float32) - bg_tiles).astype(dtype)
-        if rotation_deg:  # square each tile to the stage axes before butting them together
-            from scipy.ndimage import rotate
+    job = dict(src=str(src), channel=channel, lead=lead, offset=offset, flatfield=flatfield, darkfield=darkfield,
+               bg_tiles=bg_tiles, rotation_deg=rotation_deg, dtype=np.dtype(dtype).str, ov=ov, split=split,
+               dst=str(dst / "image"))
+    frames = list(np.ndindex(*lead_shape))   # a single empty index for a snapshot
+    n_jobs = min(n_jobs or max(1, min(6, (os.cpu_count() or 2) // 2)), len(frames))
+    if n_jobs > 1:   # frames are independent and fill separate chunks: one worker process per frame
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as mp
 
-            frame = np.stack([
-                np.stack([rotate(t.astype(np.float32), rotation_deg, reshape=False, order=1,
-                                 mode="nearest") for t in row])
-                for row in frame
-            ])
-            frame = (frame if np.issubdtype(dtype, np.floating) else np.rint(frame)).astype(dtype)
-        # tiles of a pass the run stopped in the middle of were never acquired (no time):
-        # NaN in a float store, not a dark tile
-        times = seconds[dict(zip(lead, idx))].values if lead else seconds.values
-        missing = ~np.isfinite(np.asarray(times, float))
-        if missing.any() and np.issubdtype(dtype, np.floating):
-            frame = frame.astype(dtype, copy=True)
-            frame[missing] = np.nan
-        out[idx] = stitch_tiles(frame, ov, split=split)
+        with ProcessPoolExecutor(n_jobs, mp_context=mp.get_context("spawn")) as ex:
+            list(ex.map(_stitch_frame, [dict(job, idx=idx) for idx in frames]))
+    else:
+        for idx in frames:
+            _stitch_frame(dict(job, idx=idx))
     zarr.open_group(dst, mode="r+").attrs["stitch_complete"] = True
     return xr.open_zarr(dst, consolidated=False)
 
 
 def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0, channel=None):
     """The seam geometry of a tiled acquisition, measured once and kept: measure_tile_overlaps
-    on `frame` (default the last; a textured frame fits best), saved to `path` (JSON) with what
+    on `frame` (default the last complete pass; a textured frame fits best), saved to `path` (JSON) with what
     it was measured on, and read back from there on later runs (delete it to measure again).
 
     Raises if the tiles are left more than `max_cross_px` apart across the seams (cross_dy,
@@ -354,6 +399,13 @@ def stitch_geometry(src, path, *, rotation_deg, frame=-1, max_cross_px=3.0, chan
         tiled = open_tiled(src, channel)
         lead = [d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] > 1]
         n = tiled.sizes[lead[0]] if lead else 1
+        if lead and frame < 0 and "seconds" in tiled:
+            # count back from the last complete pass: a run stopped early leaves its planned
+            # passes with no tiles (seconds 0), and seams fit on those fall back to the nominal
+            # overlap (MBO-054 run 1, frame 19 of 10 acquired)
+            sec = tiled["seconds"].values.reshape(n, -1)
+            complete = np.flatnonzero((sec > 0).all(axis=1))
+            n = int(complete[-1]) + 1 if complete.size else n
         k = frame % n
         geometry = measure_tile_overlaps(src, rotation_deg=rotation_deg, frame=k, channel=channel)
         on = Path(src).name + (f" ({channel})" if channel else "")
@@ -387,32 +439,44 @@ def fit_flatfield(src, path, *, camera_offset=80.0, channel=None):
 
 
 def stitch_run(src, dst, *, camera, geometry_path, flatfield_path, seam_frame=-1, max_cross_px=3.0,
-               channel=None):
+               channel=None, record_dir=None):
     """The standard way in for a tiled acquisition (an assay's kinetic run, a GFP or Cy5 scan):
-    seams measured or reused (stitch_geometry), flatfield fitted or reused (fit_flatfield),
+    seams measured or reused (stitch_geometry), flatfield fitted or reused (fit_flatfield; flatfield_path=None for none),
     then flatfield-corrected, rotated and stitched to the zarr store `dst` (stitch_to_zarr;
-    reopened if it exists). `camera` is {"rotation_deg": ..., "offset": ...}.
+    reopened if it exists). `camera` is {"rotation_deg": ..., "offset": ...}, optionally with "dark": a measured
+    per-pixel dark image (path or array, one camera tile), subtracted instead of the scalar offset.
 
     Returns a dict: image (the lazy (time, y, x) or (y, x) stitched image), store (the
     stitched dataset, with its attrs: seams_y / seams_x, tile_px, ...), tiled (the raw
     acquisition, with its attrs: substrate, filter, camera, start_time, ...), geometry, and
     pass_s (each frame's first tile, in s since the run started; None for a snapshot).
     `channel` picks one channel of a multi-channel acquisition (each channel gets its own
-    flatfield and store; the seams can be measured on either and reused)."""
+    flatfield and store; the seams can be measured on either and reused).
+    `record_dir` (e.g. the experiment's "1_raw-images") adds the acquisition to that folder's record of where the
+    raw images are (provenance.record_raw_source: raw_sources.csv and README.md)."""
     geometry = stitch_geometry(src, geometry_path, rotation_deg=camera["rotation_deg"],
                                frame=seam_frame, max_cross_px=max_cross_px, channel=channel)
-    flat = fit_flatfield(src, flatfield_path, camera_offset=camera["offset"], channel=channel)
-    store = stitch_to_zarr(src, dst, flatfield=flat, offset=camera["offset"],
+    # flatfield_path=None: no flatfield correction (assay runs: the chambers' own signal is the readout, MBO-054)
+    # the offset: camera["dark"] (a measured per-pixel dark image, path or array) when given, else camera["offset"];
+    # BaSiC's fit takes a scalar, the dark image's median
+    offset = camera.get("dark", camera.get("offset", 0.0))
+    scalar = float(np.median(_offset_value(offset)))
+    flat = None if flatfield_path is None else fit_flatfield(src, flatfield_path, camera_offset=scalar, channel=channel)
+    store = stitch_to_zarr(src, dst, flatfield=flat, offset=offset,
                            rotation_deg=camera["rotation_deg"], overlap=geometry, channel=channel)
     tiled = open_tiled(src, channel)
     seconds = tiled["seconds"].values
     pass_s = np.nanmin(seconds.reshape(seconds.shape[0], -1), axis=1) if seconds.ndim == 3 else None
+    if record_dir is not None:
+        from .provenance import record_raw_source
+
+        record_raw_source(src, dst, tiled, record_dir)
     from ..analysis.steps import tally_step
 
     own = Path(src).name in Path(geometry_path).stem
     tally_step("stitch_run", "Stitch tile scans",
-               ["per acquisition: BaSiC flatfield, camera offset",
-                f"subtracted, rotated {camera['rotation_deg']:g}°, tiles joined at",
+               ["per acquisition: BaSiC flatfield (none on assay runs), camera offset",
+                f"subtracted ({'measured dark image' if 'dark' in camera else 'scalar'}), rotated {camera['rotation_deg']:g}°, tiles joined at",
                 f"measured seams (≤ {max_cross_px:g} px off across a seam)",
                 "a dim scan reuses a bright scan's seams"],
                Path(src).name + (f" ({channel})" if channel else ""),
@@ -493,6 +557,51 @@ def tile_shift(reference, moving, *, tiles=None, upsample=4):
             )
             shifts.append(s)
     return tuple(float(v) for v in np.median(shifts, axis=0))
+
+
+def scan_shift(ref, mov, *, n=4, half=500, sigma=3, upsample=10):
+    """(dy, dx) of `mov`'s chip relative to `ref`'s (two stitched 2-D images of one chip): the median, over an
+    n x n grid of (2 half)-px crops, of phase correlation on edge maps (Gaussian gradient magnitude, `sigma`
+    px), so chamber walls register even where the signal is dim. The crops stay 2 `half` px clear of the
+    top, bottom and left edges and 3 `half` of the right. Add the result to a grid placed on `ref` to read
+    `mov` (MBO-051 / MBO-052's scan_shift)."""
+    from scipy import ndimage
+    from skimage.registration import phase_cross_correlation
+
+    def edges(im):
+        return ndimage.gaussian_gradient_magnitude(np.nan_to_num(np.asarray(im, np.float32)), sigma)
+
+    H, W = np.shape(ref)
+    shifts = []
+    for y in np.linspace(2 * half, H - 2 * half, n).astype(int):
+        for x in np.linspace(2 * half, W - 3 * half, n).astype(int):
+            a = edges(ref[y - half:y + half, x - half:x + half])
+            b = edges(mov[y - half:y + half, x - half:x + half])
+            shifts.append(phase_cross_correlation(a, b, upsample_factor=upsample, normalization=None)[0])
+    return tuple(float(v) for v in -np.median(shifts, axis=0))
+
+
+def cached_shift(path, measure):
+    """A (dy, dx) shift measured once and kept: `measure()` (a callable returning (dy, dx)) runs only when
+    `path` (JSON) does not exist yet; afterwards the saved values are read back. Delete the file to measure
+    again."""
+    import json
+
+    path = Path(path)
+    if not path.exists():
+        dy, dx = measure()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"dy": float(dy), "dx": float(dx)}, indent=1))
+    saved = json.loads(path.read_text())
+    return saved["dy"], saved["dx"]
+
+
+def split_channel(name):
+    """An acquisition name with an optional channel, "run|channel" (one channel of a multi-channel
+    acquisition, MBO-052), as (run, channel or None, store name): the store name is "run_channel", or just
+    "run" without a channel."""
+    run, _, channel = str(name).partition("|")
+    return run, channel or None, f"{run}_{channel}" if channel else run
 
 
 def flatfield_from_tiles(src, *, sigma=40):
