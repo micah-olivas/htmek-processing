@@ -232,11 +232,10 @@ def _label_standards(ax, conc, val, line, fontsize=7.5):
     rise = np.diff(on_line[:, 1]).min() if len(conc) > 1 else 0
     step = 1.15 * fontsize * ax.figure.dpi / 72  # one line height (px)
     flat = rise < step
-    for i, (c, v) in enumerate(sorted(zip(conc, val))):
-        if flat:  # above the line, each label one line height higher (a flat line sits low)
-            spot = on_line[i] + offset * [1, -1] + [0, step * i]
-        else:
-            spot = on_line[i] + offset
+    spots = on_line + (offset * [1, -1] + np.c_[np.zeros(len(conc)), step * np.arange(len(conc))] if flat else offset)
+    if flat:  # the stack stays inside the inset: moved down by any overshoot of its top edge
+        spots[:, 1] -= max(0.0, spots[:, 1].max() + step - ax.bbox.y1)
+    for spot, (c, v) in zip(spots, sorted(zip(conc, val))):
         ax.annotate(f"{c:g}", (c, v), xytext=to_data(spot), textcoords="data", ha="left",
                     va="bottom" if flat else "top", fontsize=fontsize, zorder=6, bbox=LABEL_BOX)
 
@@ -884,7 +883,7 @@ def _report_page(page, value, norm_col):
             if line is not None:
                 fig.key["standards_fit"] = ax.text(
                     0.96, 0.05,
-                    f"slope {_fmt(line['slope'])} / µM\nr² {_fmt(line['r2'])}",
+                    f"slope {_fmt(line['slope'])} RFU/µM\nr² {_fmt(line['r2'])}",
                     transform=ax.transAxes, ha="right", va="bottom", fontsize=10,
                     linespacing=1.2, zorder=6,
                     bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5))

@@ -360,6 +360,18 @@ def show_chamber_timeseries(
 FIT_COLORS = {"4pl": "#F7C59F", "vmax": "#B54708", "vmax_forced": "#A23B8C", "line": "0.45"}
 
 
+def save_qc_fig(fig, folder, name, *, root="5_figures/qc", dpi=200, exts=("pdf", "png")):
+    """Save a QC figure as PDF and PNG in <root>/<folder>/<name>.<ext> (folders made as needed). Returns the
+    folder."""
+    from pathlib import Path
+
+    out = Path(root) / folder
+    out.mkdir(parents=True, exist_ok=True)
+    for ext in exts:
+        fig.savefig(out / f"{name}.{ext}", dpi=dpi, bbox_inches="tight")
+    return out
+
+
 def set_plot_style(font="Arial"):
     """Global matplotlib style for every plot in the pipeline: `font` for all text (math text
     too), and no top/right spines. Call once, after importing matplotlib (e.g. in the notebook setup)."""
@@ -999,7 +1011,7 @@ def centering_examples(image, before, after, radius, labels, groups, *, half=30,
     grid point, each scaled to its own `pct` percentiles."""
     cells = [(g, tuple(int(v) for v in k)) for g, ks in groups for k in ks]
     nrows = max(1, -(-len(cells) // ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2.15 * ncols, 2.3 * nrows + 0.6), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.15 * ncols, 2.6 * nrows + 0.6), squeeze=False)
     (bx, by), (ax_, ay) = before, after
     move = np.hypot(ax_ - bx, ay - by)
     for ax, (g, k) in zip(axes.ravel(), cells):
@@ -1016,4 +1028,101 @@ def centering_examples(image, before, after, radius, labels, groups, *, half=30,
     if title:
         fig.suptitle(title, x=0.01, ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / fig.get_figheight()) if title else None)
+    return fig
+
+
+CONTROL_COLORS = {"BLANK": "0.3", "WT": "#C0392B", "N41A": "#1F4E79"}
+
+
+def button_sum_distribution(table, value="button_sum_minus_bg", *, scans=None, scan_col="scan", label="",
+                            floor=None, floor_label=None, bins=70, scale=1e6, controls=CONTROL_COLORS,
+                            variant_label="variants", display=None):
+    """Histogram of a per-chamber button readout over the variants, one panel per scan (top to bottom in `scans`
+    order; all scans in the table when None), with the control chambers as colored ticks under each histogram and
+    an optional `floor` (same units as `value`) as a dashed line. `label` names the x axis (the readout), `scale`
+    its units (1e6: 10^6 RFU). `display` maps a tag to its label (e.g. layout.display_tag). Returns the figure."""
+    scans = list(scans) if scans is not None else list(dict.fromkeys(table[scan_col]))
+    values_all = table[value] / scale
+    edges = bins if np.ndim(bins) else np.linspace(np.nanpercentile(values_all, 0.5), np.nanpercentile(values_all, 99.5), bins)
+    fig, axes = plt.subplots(len(scans), 1, figsize=(9, 2.3 * len(scans) + 0.6), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    for ax, scan in zip(axes, scans):
+        part = table[table[scan_col] == scan]
+        v = part[value] / scale
+        variant = ~part["tag"].isin(list(controls))
+        ax.hist(v[variant], bins=edges, color="0.75", edgecolor="0.4", lw=0.4, label=f"{variant_label} ({int(variant.sum())})")
+        top = ax.get_ylim()[1]
+        for i, (tag, color) in enumerate(controls.items()):   # the controls as ticks under the histogram
+            chosen = v[part["tag"] == tag]
+            ax.scatter(chosen, np.full(len(chosen), -0.06 * top * (i + 1)), marker="|", s=60, color=color,
+                       label=f"{display(tag) if display else tag} ({len(chosen)})", clip_on=False)
+        if floor is not None:
+            ax.axvline(floor / scale, color="0.3", ls="--", lw=0.8)
+        ax.set_ylim(-0.06 * top * (len(controls) + 1), top)
+        ax.set_ylabel("chambers", fontsize=12)
+        ax.set_title(scan, loc="left", fontsize=13)
+        ax.tick_params(labelsize=11)
+    axes[0].legend(frameon=False, fontsize=10, ncol=2)
+    unit = {1e6: " (10$^6$ RFU)", 1e3: " (10$^3$ RFU)", 1: " (RFU)"}.get(scale, "")
+    xlabel = label + unit + (f"; dashed: {floor_label}" if floor is not None and floor_label else "")
+    axes[-1].set_xlabel(xlabel, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def _short_rfu(v):
+    """A button sum for a crop's corner: 2.3M, 531k, 980, or -12k."""
+    if not np.isfinite(v):
+        return "n/a"
+    a = abs(v)
+    return f"{v / 1e6:.1f}M" if a >= 1e6 else f"{v / 1e3:.0f}k" if a >= 1e3 else f"{v:.0f}"
+
+
+def button_mosaic(image, cx, cy, tags, values, *, half=30, radius=None, pct=(1, 99.5), title=None, value_label="button sum",
+                  tile_in=0.62, fontsize=3.6, cmap="gray"):
+    """Every chamber's button as one crop, laid out as the chip (n_rows x n_cols tiles): the crop of `image` centered
+    on (cx, cy) (n_rows x n_cols arrays), 2 `half` px across, with the variant top left (`tags`, n_rows x n_cols),
+    "r<row> c<col>" top right (counted from 1) and `values` (n_rows x n_cols, e.g. the bg-subtracted button sum)
+    bottom left. One contrast for every crop, the `pct` percentiles of all crops, so buttons compare; `radius` draws
+    the button ROI. A crop that runs off the image is padded with NaN (drawn as the lowest value). Returns the figure."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    from ..processing.layout import display_tag
+
+    image = np.asarray(image, np.float32)
+    n_rows, n_cols = np.shape(cx)
+    w = 2 * half
+    mosaic = np.full((n_rows * w, n_cols * w), np.nan, np.float32)
+    pad = np.pad(image, half, constant_values=np.nan)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            x, y = int(round(cx[r, c])) + half, int(round(cy[r, c])) + half
+            crop = pad[y - half:y + half, x - half:x + half]
+            if crop.shape == (w, w):
+                mosaic[r * w:(r + 1) * w, c * w:(c + 1) * w] = crop
+    lo, hi = np.nanpercentile(mosaic, pct)
+    fig = plt.figure(figsize=(n_cols * tile_in, n_rows * tile_in + (0.5 if title else 0.15)))
+    ax = fig.add_axes([0, 0, 1, n_rows * tile_in / fig.get_figheight()])
+    ax.imshow(np.nan_to_num(mosaic, nan=lo), cmap=cmap, vmin=lo, vmax=hi, interpolation="nearest")
+    for k in range(1, n_cols):
+        ax.axvline(k * w - 0.5, color="#3A3A3A", lw=0.4)
+    for k in range(1, n_rows):
+        ax.axhline(k * w - 0.5, color="#3A3A3A", lw=0.4)
+    box = dict(boxstyle="square,pad=0.1", fc="black", ec="none", alpha=0.55)
+    vals = np.asarray(values, float)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            x0, y0 = c * w, r * w
+            if radius:
+                ax.add_patch(Circle((x0 + half - 0.5 + (cx[r, c] - round(cx[r, c])), y0 + half - 0.5 + (cy[r, c] - round(cy[r, c]))),
+                                    radius, fill=False, ec="#F1C40F", lw=0.3, alpha=0.7))
+            kw = dict(fontsize=fontsize, color="white", bbox=box)
+            ax.text(x0 + 1.5, y0 + 1.5, display_tag(tags[r][c]), ha="left", va="top", **kw)
+            ax.text(x0 + w - 1.5, y0 + 1.5, f"r{r + 1} c{c + 1}", ha="right", va="top", **kw)
+            ax.text(x0 + 1.5, y0 + w - 1.5, _short_rfu(vals[r, c]), ha="left", va="bottom", **kw)
+    ax.set_axis_off()
+    if title:
+        fig.text(0.005, 1 - 0.12 / fig.get_figheight(), f"{title}  ·  bottom left: {value_label} (RFU); contrast {lo:,.0f}-{hi:,.0f} RFU",
+                 ha="left", va="top", fontsize=9)
     return fig
