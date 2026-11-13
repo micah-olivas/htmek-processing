@@ -605,3 +605,23 @@ def chamber_outside_button(stack, chamber_x, chamber_y, button_x, button_y, *, c
             if v.size:
                 values[(t,) + idx] = reduce(v)
     return (values[0], n_px[0]) if single else (values, n_px)
+
+
+FLAGS = ("complete_pass", "tile_imaged", "light_off", "dim_first_pass")
+
+
+def usable_points(traces, value="chamber_ROI_median", keys=("mark_row", "mark_col"), flags=FLAGS):
+    """The points of a progress-curve table that pass its flags, with `<value>_minus_frame0` measured from each
+    chamber's first remaining point. A True `complete_pass` / `tile_imaged` keeps a point; a True `light_off` /
+    `dim_first_pass` drops it; flags missing from the table are ignored. The process step records the flags, the
+    analysis step calls this, so quantification never drops data."""
+    keep = np.ones(len(traces), bool)
+    for f in flags:
+        if f in traces:
+            v = traces[f].astype(bool).to_numpy()
+            keep &= v if f in ("complete_pass", "tile_imaged") else ~v
+    t = traces[keep].copy()
+    keys = list(keys)
+    first = t.sort_values("frame").groupby(keys)[value].transform("first")
+    t[f"{value}_minus_frame0"] = t[value] - first
+    return t
