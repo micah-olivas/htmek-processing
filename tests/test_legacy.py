@@ -79,3 +79,19 @@ def test_stitch_run_with_legacy_geometry(tmp_path):
     img = s["image"].values
     assert img.shape == (2, R * H, C * W)
     assert (img[:, H:, :W] == 120).all() and (img[:, :H, 2 * W:] == 0).all()   # butted, columns mirrored
+
+
+def test_float_tiles_without_tags(tmp_path):
+    """A processed copy: float32 tiles with no TIFF tags (MBO-R01's "_rebinned" GFP scans)."""
+    (tmp_path / "scan").mkdir()
+    for r in range(R):
+        for c in range(C):
+            tifffile.imwrite(tmp_path / "scan" / f"4-Pos{c:03d}_{r:03d}_500.tif",
+                             np.full((H, W), 100.25 * r + 10.5 * c + 0.125, np.float32))
+    ds = hp.open_tiled(hp.read_legacy_tiles(tmp_path / "scan", tmp_path / "out", overlap=0, mirror_cols=False))
+    assert ds["tile"].dtype == np.float32
+    assert np.allclose(ds["tile"].values[1, 2], 100.25 + 21.0 + 0.125)             # not truncated to an integer
+    assert np.isnan(ds["seconds"].values).all() and ds.attrs["start_time"] == ""
+    assert ds["row"].values.tolist() == [0.0, 1.0] and ds["col"].values.tolist() == [0.0, 1.0, 2.0]
+    with pytest.raises(ValueError, match="stage"):
+        hp.read_legacy_tiles(tmp_path / "scan", tmp_path / "out2", overlap=0, positions="stage")

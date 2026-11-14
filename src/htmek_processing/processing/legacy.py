@@ -81,6 +81,10 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
     geometry with legacy_geometry, which stitch_run then reads instead of measuring (measure_tile_overlaps needs an
     overlap to register). `seconds` is each tile's DateTime tag (1 s resolution) minus the first tile's.
 
+    Raw tiles (integers) are written as uint16. Tiles stored as floats (processed copies, e.g. MBO-R01's "_rebinned"
+    GFP scans) are kept as float32, never cast to integers; such copies often lack the TIFF tags, so their `seconds`
+    are NaN, `start_time` is empty, and with no stage positions the `row` / `col` coordinates are the grid indices.
+
     Written to `dst/<group>`; an existing store is reused unless `overwrite`."""
     import dask
     import dask.array as da
@@ -109,6 +113,8 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
             key = lambda k: (int(np.searchsorted(ys, round(m[k]["stage"][1], 1))),
                              int(np.searchsorted(xs, round(m[k]["stage"][0], 1))))
             return {key(k): t[k] for k in t}, {key(k): m[k] for k in m}
+        if any(np.isnan(v["stage"]).any() for m in meta for v in m.values()):
+            raise ValueError("positions='stage' needs every tile's stage position (ImageDescription Pos); use 'filename'")
         tiles, meta = map(list, zip(*(by_stage(t, m) for t, m in zip(tiles, meta))))
 
     if mirror_cols:
@@ -125,30 +131,37 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
 
     first = tifffile.imread(tiles[0][(0, 0)])
     h, w = first.shape
+    dtype = np.uint16 if np.issubdtype(first.dtype, np.integer) else np.float32   # never truncate processed float tiles
     stage = np.array([[meta[0][(r, c)]["stage"] for c in range(C)] for r in range(R)])   # (R, C, 2), µm
     times = np.array([[[m[(r, c)]["time"] for c in range(C)] for r in range(R)] for m in meta])
-    start = min(times.ravel())
-    seconds = np.vectorize(lambda t: (t - start).total_seconds())(times).astype(float)
+    known = [t for t in times.ravel() if t is not None]
+    start = min(known) if known else None
+    seconds = np.vectorize(lambda t: (t - start).total_seconds() if t is not None and start is not None else np.nan,
+                           otypes=[float])(times)
 
-    read = dask.delayed(lambda p: tifffile.imread(p).astype(np.uint16))
-    stack = da.stack([da.stack([da.stack([da.from_delayed(read(t[(r, c)]), (h, w), np.uint16) for c in range(C)])
+    read = dask.delayed(lambda p: tifffile.imread(p).astype(dtype))
+    stack = da.stack([da.stack([da.stack([da.from_delayed(read(t[(r, c)]), (h, w), dtype) for c in range(C)])
                                 for r in range(R)]) for t in tiles])            # (time, row, col, y, x)
     channel = meta[0][(0, 0)]["channel"]
     exposure = meta[0][(0, 0)]["exposure_ms"]
-    coords = dict(row=np.nanmedian(stage[:, :, 1], axis=1), col=np.nanmedian(stage[:, :, 0], axis=0))
+    if np.isnan(stage).all():   # no stage positions recorded: grid indices
+        coords = dict(row=np.arange(R, dtype=float), col=np.arange(C, dtype=float))
+    else:
+        coords = dict(row=np.nanmedian(stage[:, :, 1], axis=1), col=np.nanmedian(stage[:, :, 0], axis=0))
     dims = ("time", "row", "col")
     ds = xr.Dataset(
         dict(tile=(dims + ("y", "x"), stack), seconds=(dims, seconds),
              stage_x=(("row", "col"), stage[:, :, 0]), stage_y=(("row", "col"), stage[:, :, 1])),
         coords=coords,
-        attrs=dict(overlap=float(overlap), start_time=start.isoformat(), channel=channel or "",
+        attrs=dict(overlap=float(overlap), start_time=start.isoformat() if start else "", channel=channel or "",
                    exposure_ms=exposure if exposure is not None else "", legacy=True, positions=positions, mirror_cols=bool(mirror_cols),
                    source=str(Path(src)), passes=[p.name for p in passes],
                    info=f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles, {channel} {exposure:g} ms"
                    if exposure is not None else f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles"))
     if snapshot:
         ds = ds.isel(time=0, drop=True)
-        ds["timestamp"] = (("row", "col"), times[0].astype("datetime64[ns]"))
+        ds["timestamp"] = (("row", "col"), np.array([[np.datetime64(t, "ns") if t is not None else np.datetime64("NaT", "ns")
+                                                      for t in row] for row in times[0]]))
     ds["tile"].encoding["chunks"] = (1,) * (ds["tile"].ndim - 2) + (h, w)
     out.parent.mkdir(parents=True, exist_ok=True)
     ds.to_zarr(out, mode="w", consolidated=False)
