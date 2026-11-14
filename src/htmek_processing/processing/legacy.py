@@ -15,6 +15,7 @@ import numpy as np
 _TILE = re.compile(r"Pos(\d+)_(\d+)")
 _POS = re.compile(r"Pos:\(\s*([-\d.eE]+)\s*,\s*([-\d.eE]+)\s*\)")
 _CHANNEL = re.compile(r"Channel:\s*([^,}]+)")
+_FOLDER_TIME = re.compile(r"(\d{8})-(\d{6})")   # the acquisition software names each scan folder YYYYMMDD-HHMMSS_...
 
 
 def _tiles_in(folder):
@@ -85,7 +86,8 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
     GFP scans) are kept as float32, never cast to integers. Such copies often lack the TIFF tags: a snapshot with no
     tile times gets `seconds` 0 for every tile (attr times_recorded=False; NaN would mark its tiles as never acquired,
     and stitch_to_zarr would blank them), and a timecourse without them raises (its kinetics need the times); with no
-    stage positions the `row` / `col` coordinates are the grid indices.
+    stage positions the `row` / `col` coordinates are the grid indices. Without tile times, `start_time` is read from the
+    pass folder's name (YYYYMMDD-HHMMSS, the scan's start; attr start_time_source="folder name").
 
     Written to `dst/<group>`; an existing store is reused unless `overwrite`."""
     import dask
@@ -139,6 +141,11 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
     known = [t for t in times.ravel() if t is not None]
     start = min(known) if known else None
     times_recorded = all(t is not None for t in times.ravel())
+    start_source = "tiles" if start is not None else ""
+    if start is None:   # processed copies drop the tags; the scan folder's name still holds its start
+        m = _FOLDER_TIME.search(passes[0].name)
+        if m:
+            start, start_source = datetime.strptime("".join(m.groups()), "%Y%m%d%H%M%S"), "folder name"
     if not times_recorded and not snapshot:
         raise ValueError(f"{src}: tiles without a DateTime tag in a timecourse; its kinetics need every tile's time")
     seconds = (np.vectorize(lambda t: (t - start).total_seconds(), otypes=[float])(times) if times_recorded
@@ -159,7 +166,7 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
              stage_x=(("row", "col"), stage[:, :, 0]), stage_y=(("row", "col"), stage[:, :, 1])),
         coords=coords,
         attrs=dict(overlap=float(overlap), start_time=start.isoformat() if start else "", channel=channel or "",
-                   exposure_ms=exposure if exposure is not None else "", legacy=True, positions=positions, mirror_cols=bool(mirror_cols), times_recorded=times_recorded,
+                   exposure_ms=exposure if exposure is not None else "", legacy=True, positions=positions, mirror_cols=bool(mirror_cols), times_recorded=times_recorded, start_time_source=start_source,
                    source=str(Path(src)), passes=[p.name for p in passes],
                    info=f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles, {channel} {exposure:g} ms"
                    if exposure is not None else f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles"))
