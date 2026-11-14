@@ -357,3 +357,6 @@ from .analysis.kinetics_qc import (  # noqa: F401
     plot_rate_definition_km_scatter,
     plot_rate_definition_km_by_scan,
 )
+
+from .processing.legacy import read_legacy_tiles, legacy_passes, legacy_geometry  # noqa: F401,E402
+__all__ += ["read_legacy_tiles", "legacy_passes", "legacy_geometry"]
