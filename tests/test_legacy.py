@@ -91,7 +91,11 @@ def test_float_tiles_without_tags(tmp_path):
     ds = hp.open_tiled(hp.read_legacy_tiles(tmp_path / "scan", tmp_path / "out", overlap=0, mirror_cols=False))
     assert ds["tile"].dtype == np.float32
     assert np.allclose(ds["tile"].values[1, 2], 100.25 + 21.0 + 0.125)             # not truncated to an integer
-    assert np.isnan(ds["seconds"].values).all() and ds.attrs["start_time"] == ""
+    assert (ds["seconds"].values == 0).all() and ds.attrs["start_time"] == "" and ds.attrs["times_recorded"] is False
+    s = hp.stitch_run(tmp_path / "out", tmp_path / "stitched.zarr", camera={"rotation_deg": 0.0, "offset": 0.0},
+                      geometry_path=hp.legacy_geometry(tmp_path / "g.json", tmp_path / "out") and tmp_path / "g.json",
+                      flatfield_path=None)
+    assert np.isfinite(s["image"].values).all()                                     # no tile blanked
     assert ds["row"].values.tolist() == [0.0, 1.0] and ds["col"].values.tolist() == [0.0, 1.0, 2.0]
     with pytest.raises(ValueError, match="stage"):
         hp.read_legacy_tiles(tmp_path / "scan", tmp_path / "out2", overlap=0, positions="stage")

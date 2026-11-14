@@ -82,8 +82,10 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
     overlap to register). `seconds` is each tile's DateTime tag (1 s resolution) minus the first tile's.
 
     Raw tiles (integers) are written as uint16. Tiles stored as floats (processed copies, e.g. MBO-R01's "_rebinned"
-    GFP scans) are kept as float32, never cast to integers; such copies often lack the TIFF tags, so their `seconds`
-    are NaN, `start_time` is empty, and with no stage positions the `row` / `col` coordinates are the grid indices.
+    GFP scans) are kept as float32, never cast to integers. Such copies often lack the TIFF tags: a snapshot with no
+    tile times gets `seconds` 0 for every tile (attr times_recorded=False; NaN would mark its tiles as never acquired,
+    and stitch_to_zarr would blank them), and a timecourse without them raises (its kinetics need the times); with no
+    stage positions the `row` / `col` coordinates are the grid indices.
 
     Written to `dst/<group>`; an existing store is reused unless `overwrite`."""
     import dask
@@ -136,8 +138,11 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
     times = np.array([[[m[(r, c)]["time"] for c in range(C)] for r in range(R)] for m in meta])
     known = [t for t in times.ravel() if t is not None]
     start = min(known) if known else None
-    seconds = np.vectorize(lambda t: (t - start).total_seconds() if t is not None and start is not None else np.nan,
-                           otypes=[float])(times)
+    times_recorded = all(t is not None for t in times.ravel())
+    if not times_recorded and not snapshot:
+        raise ValueError(f"{src}: tiles without a DateTime tag in a timecourse; its kinetics need every tile's time")
+    seconds = (np.vectorize(lambda t: (t - start).total_seconds(), otypes=[float])(times) if times_recorded
+               else np.zeros(times.shape))   # a snapshot without times: 0, not NaN (NaN marks a tile never acquired)
 
     read = dask.delayed(lambda p: tifffile.imread(p).astype(dtype))
     stack = da.stack([da.stack([da.stack([da.from_delayed(read(t[(r, c)]), (h, w), dtype) for c in range(C)])
@@ -154,7 +159,7 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
              stage_x=(("row", "col"), stage[:, :, 0]), stage_y=(("row", "col"), stage[:, :, 1])),
         coords=coords,
         attrs=dict(overlap=float(overlap), start_time=start.isoformat() if start else "", channel=channel or "",
-                   exposure_ms=exposure if exposure is not None else "", legacy=True, positions=positions, mirror_cols=bool(mirror_cols),
+                   exposure_ms=exposure if exposure is not None else "", legacy=True, positions=positions, mirror_cols=bool(mirror_cols), times_recorded=times_recorded,
                    source=str(Path(src)), passes=[p.name for p in passes],
                    info=f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles, {channel} {exposure:g} ms"
                    if exposure is not None else f"legacy tiled TIFF scan, {len(passes)} pass(es) of {R} x {C} tiles"))
