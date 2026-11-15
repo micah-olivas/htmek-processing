@@ -16,4 +16,13 @@ def test_mosaic_tiles_and_labels():
     ax = fig.axes[0]
     assert ax.images[0].get_array().shape == (60, 40)
     texts = [t.get_text() for t in ax.texts]
-    assert "F22φ" in texts and "r3 c2" in texts and texts.count("2.3M") == 6
+    assert "F22tag" in texts and "r3 c2" in texts and texts.count("2.3M") == 6
+
+
+def test_tag_suffix():
+    assert hp.display_tag("A4*") == "A4tag" and hp.display_tag("WT") == "WT"
+    hp.set_tag_suffix("φ")
+    try:
+        assert hp.display_tag("F22*") == "F22φ"
+    finally:
+        hp.set_tag_suffix("tag")

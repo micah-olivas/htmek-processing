@@ -27,6 +27,7 @@ from .processing.layout import (  # noqa: F401
     mirror_pinlist,
     chamber_tags,
     display_tag,
+    set_tag_suffix,
 )
 from .processing.io import (  # noqa: F401
     load_image,

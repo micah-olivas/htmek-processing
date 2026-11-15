@@ -48,7 +48,7 @@ class _Event:
 def adjuster(tmp_path):
     img = np.random.default_rng(0).random((4, 2000, 1200)).astype(np.float32)   # (time, y, x)
     corners = [[100, 100], [1100, 100], [1100, 1900], [100, 1900]]
-    ga = hp.GridAdjuster(img, n_rows=56, n_cols=32, corners=corners, radius=10, frame=-1,
+    ga = hp.GridAdjuster(img, n_rows=56, n_cols=32, corners=corners, radius=10, frame=-1, local_fixes=True,
                          corners_path=tmp_path / "c.json", warp_path=tmp_path / "w.json")
     return ga, tmp_path
 

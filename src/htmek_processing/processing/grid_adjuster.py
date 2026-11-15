@@ -19,17 +19,22 @@ DUMBBELL_BG_MARGIN = 10
 from .quantify import centers_to_df, kinetic_traces
 
 CTRL_COLOR = "#FF4FD8"  # local corrections (magenta: apart from the cyan corners and yellow ROIs)
+ACCENT = "#4A90D9"      # slider fills and knobs, the selected grid button
+GRID_COLORS = {"reaction": "#FFE600", "dna": "#3FE0FF"}   # paired mode: each grid keeps its color, active or not
+GRID_TEXT = {"dark": GRID_COLORS, "light": {"reaction": "#9A7B00", "dna": "#007A99"}}   # the same, for text on the theme
+NECK_COLOR = "white"
+HALO = 2.4              # a dark outline this many points wider than each mask line, so masks show on bright and dark areas
 
 # The window's colors, light and dark (the image itself is always gray on black). `rc` is
 # applied while the window and its sliders are built; the rest colors the "How to use" panel.
 THEMES = {
     "light": dict(rc={}, panel="#F5F7FA", panel_edge="0.75", key="white", key_edge="0.35",
-                  line="0.3", rule="0.8", text="black", note="0.4"),
+                  line="0.3", rule="0.8", text="black", note="0.4", track="#D9DCE1", box="white"),
     "dark": dict(rc={"figure.facecolor": "#1E1E1E", "axes.facecolor": "#2A2A2A", "axes.edgecolor": "0.6",
                      "text.color": "0.9", "axes.labelcolor": "0.9", "xtick.color": "0.8",
                      "ytick.color": "0.8"},
                  panel="#2A2D31", panel_edge="0.4", key="#3A3D42", key_edge="0.65",
-                 line="0.75", rule="0.4", text="0.92", note="0.65"),
+                 line="0.75", rule="0.4", text="0.92", note="0.65", track="#4A4D52", box="#2A2D31"),
 }
 
 
@@ -57,9 +62,38 @@ def os_dark_mode():
     except Exception:   # no such setting, no gsettings, ...: light
         return False
 
+def _halo(artist, lw):
+    """A dark outline under a mask line (patheffects), so it reads on bright and dark image areas alike."""
+    from matplotlib import patheffects as pe
+
+    artist.set_path_effects([pe.Stroke(linewidth=lw + HALO, foreground="black", alpha=0.55), pe.Normal()])
+
+
+def neck_lines(reaction, dna, r_reaction, r_dna, width):
+    """The two edges of every chamber's neck, as one (x, y) line with NaN between segments: a strip `width` px
+    wide from the reaction chamber's circle to the DNA chamber's, along the line between their centers.
+    `reaction`, `dna` = (cx, cy) arrays of the same shape."""
+    rx, ry = np.ravel(reaction[0]), np.ravel(reaction[1])
+    dx, dy = np.ravel(dna[0]) - rx, np.ravel(dna[1]) - ry
+    L = np.hypot(dx, dy)
+    L = np.where(L > 0, L, np.nan)
+    ux, uy = dx / L, dy / L
+    nx, ny = -uy, ux
+    h = width / 2.0
+    a = np.sqrt(np.maximum(r_reaction**2 - h**2, 0.0))   # where each edge leaves the reaction chamber's circle
+    b = np.sqrt(np.maximum(r_dna**2 - h**2, 0.0))
+    xs, ys = [], []
+    for side in (1.0, -1.0):
+        x0, y0 = rx + ux * a + side * nx * h, ry + uy * a + side * ny * h
+        x1, y1 = rx + dx - ux * b + side * nx * h, ry + dy - uy * b + side * ny * h
+        xs.append(np.column_stack([x0, x1, np.full_like(x0, np.nan)]))
+        ys.append(np.column_stack([y0, y1, np.full_like(y0, np.nan)]))
+    return np.concatenate(xs).ravel(), np.concatenate(ys).ravel()
+
+
 # the on-screen key: mouse actions (button, marker, color, size, what) and hotkeys (keys, what)
 KEY_MOUSE = [
-    ("left", "o", "cyan", 12, "drag a corner: place the grid"),
+    ("left", "o", "white", 12, "drag a corner: place the grid"),
     ("left", "D", CTRL_COLOR, 7, "drag any circle: fix it locally (the grid around it follows)"),
     ("right", "D", CTRL_COLOR, 7, "right-click a fix: remove it"),
 ]
@@ -105,8 +139,20 @@ class GridAdjuster:
     The shape is saved with the corners (and wins over `dumbbell=` once saved); read it with
     quantify.dumbbell_timecourse.
 
+    Paired mode (`dna` = {corners_path, warp_path, radius, offset=(dx, dy)}): two grids in one window, the
+    reaction chambers (this grid: `radius`, `corners_path`, `warp_path`) and the DNA chambers (circles of
+    dna["radius"]), each with its own corners and local corrections, saved to its own files. Tab, or the
+    "placing" buttons, switches which grid you drag; the other stays drawn, dashed. Each chamber's neck
+    (`neck_width` px) is drawn between its two centers and follows either end. The DNA grid starts at this
+    grid moved by dna["offset"] (with this grid's local corrections) until its corners file exists.
+    `bg_outer` is the background ring's margin beyond the dumbbell's outline; it and `neck_width` are saved
+    with the reaction grid. Read them with grid.load_mask and quantify.dumbbell_intensities(dna_x=, dna_y=).
+
     The window follows the OS's light or dark appearance (os_dark_mode); `dark=True` or
     `dark=False` overrides it.
+
+    Dragging single chambers (local corrections) is off by default; `local_fixes=True` turns it on. Corrections
+    already saved in `warp_path` are still applied.
 
     A "How to use" panel left of the image lists the mouse actions and the hotkeys
     (KEY_KEYS): z zoom box, + / − zoom where the mouse is, two-finger scroll pans, h or 0 home, p pan, esc leave
@@ -143,6 +189,9 @@ class GridAdjuster:
         dark=None,
         dumbbell=None,
         block=True,
+        dna=None,
+        neck_width=None,
+        local_fixes=False,
     ):
         # the window's theme: the OS's appearance unless `dark` is given
         self.theme = THEMES["dark" if (os_dark_mode() if dark is None else dark) else "light"]
@@ -209,11 +258,35 @@ class GridAdjuster:
 
         self.corners = np.asarray(corners, float)
         self._drag = None
+        # dragging single chambers (local corrections, saved to warp_path) is off unless asked for: the grid is set by
+        # its 4 corners only. Saved corrections are still read and applied (grid.warped_grid reads them too)
+        self.local_fixes = bool(local_fixes)
+        self.paired = dna is not None
+        if self.paired:   # two grids: the active one lives in self.corners / controls / radius / paths
+            self.dumbbell = None
+            if saved.get("bg_outer") is None and bg_outer is None:
+                self.bg_outer = DUMBBELL_BG_MARGIN
+            self.neck_width = float(saved.get("neck_width") or neck_width or 20.0)
+            dpath = Path(dna["corners_path"])
+            dsaved = load_mask(dpath) if dpath.exists() else {}
+            dwarp = Path(dna["warp_path"]) if dna.get("warp_path") else None
+            dx, dy = dna.get("offset", (0.0, 0.0))
+            self._grids = {
+                "reaction": None,   # filled from the attributes on a switch
+                "dna": dict(corners=np.asarray(dsaved.get("corners") or dna.get("corners") or self.corners + [dx, dy], float),
+                            controls=({(int(r), int(c)): (ddx, ddy) for r, c, ddx, ddy in load_warp(dwarp)}
+                                      if dwarp is not None and dwarp.exists() else dict(self.controls)),
+                            corners_path=dpath, warp_path=dwarp,
+                            radius=dsaved.get("radius") if dsaved.get("radius") is not None else dna.get("radius", self.radius)),
+            }
+            self._active = "reaction"
         with plt.rc_context(self.theme["rc"]):
             self._build(vmin_pct, vmax_pct, figsize)
         # saved as soon as the window opens (and after every change), so a later cell always
         # finds the placement, even when only local corrections were made
         self._persist()
+        if self.paired:
+            self._save_state(self._grids["dna"], "dna")
         if block:
             self.wait()
 
@@ -307,9 +380,64 @@ class GridAdjuster:
         df.attrs["corners"] = self.corners.copy().tolist()
         return df
 
+    GRID_ATTRS = ("corners", "controls", "corners_path", "warp_path", "radius")
+
+    def _state(self):
+        """The active grid's state (paired mode)."""
+        return {k: getattr(self, k) for k in self.GRID_ATTRS}
+
+    def _other(self):
+        return "dna" if self._active == "reaction" else "reaction"
+
+    @staticmethod
+    def _state_centers(state, n_rows, n_cols):
+        cx, cy = bilinear_grid(state["corners"], n_rows, n_cols)
+        if state["controls"]:
+            dx, dy = warp_offsets([[*rc, *d] for rc, d in state["controls"].items()], n_rows, n_cols)
+            cx, cy = cx + dx, cy + dy
+        return cx, cy
+
+    def _save_state(self, state, role):
+        """Save one grid of a pair: its corners and radius (the reaction grid also the background margin and the
+        neck), and its local corrections."""
+        if state["corners_path"] is not None:
+            save_corners(state["corners_path"], state["corners"], radius=state["radius"], bg_inner=state["radius"],
+                         bg_outer=self.bg_outer if role == "reaction" else None,
+                         extra={"role": role, **({"neck_width": self.neck_width} if role == "reaction" else {})})
+        if state["warp_path"] is not None:
+            save_warp(state["warp_path"], state["controls"])
+
+    def switch_grid(self, name=None):
+        """Paired mode: drag the other grid (or `name`: "reaction" / "dna")."""
+        if not self.paired:
+            return
+        name = name or self._other()
+        if name == self._active:
+            return
+        self._grids[self._active] = self._state()
+        for k, v in self._grids[name].items():
+            setattr(self, k, v)
+        self.bg_inner = self.radius
+        self._active = name
+        self._switching = True
+        self._radius_slider.set_val(self.radius)
+        self._switching = False
+        if hasattr(self, "_grid_radio") and self._grid_radio.value_selected != self.GRID_NAMES[name]:
+            self._grid_radio.set_active(list(self.GRID_NAMES).index(name))
+        self._set_diameter(self._roi, self.radius)
+        self._roi.set_edgecolor(GRID_COLORS[self._active])
+        self._other_roi.set_edgecolor(GRID_COLORS[self._other()])
+        self._update_artists()
+        self.fig.canvas.draw_idle()
+
+    GRID_NAMES = {"reaction": "reaction chambers", "dna": "DNA chambers"}
+
     def save_corners(self, path=None):
         """Save the full mask (corners + radius + annulus, and the dumbbell's shape) to JSON so
         the next GridAdjuster with the same corners_path resumes exactly where you left off."""
+        if self.paired:
+            self._save_state(self._state(), self._active)
+            return str(self.corners_path)
         return save_corners(
             path or self.corners_path,
             self.corners,
@@ -400,6 +528,19 @@ class GridAdjuster:
             self._roi = rings(self.radius, "yellow", 0.8)
             self._bg_in = rings(self.bg_inner, "orange", 0.6, ":")
             self._bg_out = rings(self.bg_outer, "orange", 0.6, ":")
+        if self.paired:
+            from matplotlib.lines import Line2D
+
+            self._bg_in.set_visible(False)   # the background is a ring around the whole dumbbell, not per circle
+            self._bg_out.set_visible(False)
+            ocx, ocy = self._state_centers(self._grids["dna"], self.n_rows, self.n_cols)
+            self._other_pts = np.column_stack([ocx.ravel(), ocy.ravel()])
+            d = np.full(len(self._other_pts), 2.0 * self._grids["dna"]["radius"])
+            from matplotlib.collections import EllipseCollection as _EC
+            self._other_roi = _EC(d, d, np.zeros(len(d)), units="xy", offsets=self._other_pts, offset_transform=self.ax.transData,
+                                  facecolors="none", edgecolors="#7FDBFF", linewidths=0.6, linestyles="--", alpha=0.8)
+            self.ax.add_collection(self._other_roi)
+            self._necks = self.ax.add_line(Line2D([], [], color="yellow", lw=0.6, alpha=0.8))
         (self._grid_pts,) = self.ax.plot(cx.ravel(), cy.ravel(), "r.", ms=3)
 
         # "col,row" labels beside each ROI -- only on small chips, where they stay legible
@@ -499,7 +640,7 @@ class GridAdjuster:
         # the "How to use" panel left of the image (refit on resize), the sliders right of it
         self.fig.subplots_adjust(left=self.PANEL_RIGHT + 0.06)
         x0 = self.PANEL_RIGHT + 0.14  # room for the slider labels ("bg outer") left of the bars
-        right = 0.9 if self.dumbbell is None else 0.58   # dumbbell mode: a second column of sliders
+        right = 0.9 if (self.dumbbell is None and not self.paired) else 0.58   # a second column of sliders
         for s in (getattr(self, "_frame_slider", None), self._vmin_slider, self._vmax_slider,
                   self._radius_slider, self._bg_outer_slider):
             if s is not None:
@@ -517,6 +658,21 @@ class GridAdjuster:
                 self._dumbbell_sliders.append(slider)
             self._bg_outer_slider.label.set_text("bg margin")
             self._radius_slider.label.set_text("chamber r")
+        if self.paired:
+            from matplotlib.widgets import RadioButtons
+
+            neck = Slider(self.fig.add_axes([0.70, 0.23, 0.2, 0.02]), "neck", 1, 300, valinit=self.neck_width, valstep=1)
+            neck.on_changed(self._on_neck)
+            self._dumbbell_sliders.append(neck)
+            self._bg_outer_slider.label.set_text("bg margin")
+            self._radius_slider.label.set_text("circle r")
+            ax_radio = self.fig.add_axes([0.70, 0.08, 0.2, 0.11])
+            ax_radio.set_axis_off()
+            ax_radio.set_title("placing (Tab switches)", fontsize=9, loc="left", color=self.theme["text"])
+            self._grid_radio = RadioButtons(ax_radio, list(self.GRID_NAMES.values()), active=0)
+            self._grid_radio.on_clicked(lambda label: self.switch_grid({v: k for k, v in self.GRID_NAMES.items()}[label]))
+            for label in self._grid_radio.labels:
+                label.set_color(self.theme["text"])
         self._key_ax = None
         self._draw_key()
         self.fig.canvas.mpl_connect("resize_event", lambda e: self._draw_key())
@@ -530,7 +686,95 @@ class GridAdjuster:
         if hasattr(self._mask_check, "set_frame_props"):   # matplotlib >= 3.7: the box follows the theme
             self._mask_check.set_frame_props({"edgecolor": self.theme["text"]})
             self._mask_check.set_check_props({"facecolor": self.theme["text"]})
+        self._style_controls()
         self._update_artists()
+
+    SLIDER_ROWS = (0.215, 0.175, 0.135, 0.095, 0.055)   # figure y of the slider rows, top to bottom (below the image's tick labels)
+
+    def _style_controls(self):
+        """The controls' look: masks colored by grid with a dark outline; sliders in even rows, theme-colored, each
+        with a box to type its value in; the grid buttons and corner handles visible on either theme."""
+        from matplotlib.widgets import TextBox
+
+        th = self.theme
+        # masks: the active grid thicker; in paired mode each grid in its own color
+        if self.paired:
+            self._roi.set_edgecolor(GRID_COLORS[self._active]); self._roi.set_linewidth(1.4); _halo(self._roi, 1.4)
+            self._other_roi.set_edgecolor(GRID_COLORS[self._other()]); self._other_roi.set_linewidth(0.9)
+            self._other_roi.set_linestyle("-"); self._other_roi.set_alpha(1.0); _halo(self._other_roi, 0.9)
+            self._necks.set_color(NECK_COLOR); self._necks.set_linewidth(0.9); self._necks.set_alpha(1.0); _halo(self._necks, 0.9)
+        else:
+            for a, lw in ((self._roi, 1.2), (self._bg_out, 0.7)):
+                a.set_linewidth(lw); _halo(a, lw)
+        self._corner_pts.set_markeredgecolor("white"); self._corner_pts.set_markerfacecolor("none")
+        _halo(self._corner_pts, 2.0)
+        for lab in self._labels:
+            lab.set_color("white"); _halo(lab, 0.5)
+        self._grid_pts.set_markersize(2.5)
+
+        # sliders: two columns of even rows; the left one for the image and the active grid, the right for the pair
+        left = [s for s in (getattr(self, "_frame_slider", None), self._vmin_slider, self._vmax_slider,
+                            self._radius_slider, self._bg_outer_slider) if s is not None]
+        right = list(self._dumbbell_sliders)
+        x0 = self.PANEL_RIGHT + 0.12
+        x1 = 0.56 if right or self.paired else 0.84
+        self._value_boxes = []
+        for col, (sliders, (a, b)) in enumerate(((left, (x0, x1)), (right, (0.71, 0.90)))):
+            for s, y in zip(sliders, self.SLIDER_ROWS):
+                s.ax.set_position([a, y, b - a, 0.018])
+                s.track.set_facecolor(th["track"])
+                s.poly.set_facecolor(ACCENT)
+                s._handle.set_markerfacecolor(ACCENT); s._handle.set_markeredgecolor("white"); s._handle.set_markersize(11)
+                s.label.set_position((-0.03, 0.5))
+                s.valtext.set_visible(False)
+                box_ax = self.fig.add_axes([b + 0.008, y - 0.006, 0.05, 0.03])
+                box = TextBox(box_ax, "", initial=self._fmt(s.val), color=th["box"], hovercolor=th["panel"], textalignment="center")
+                box.text_disp.set_color(th["text"])
+                for sp in box_ax.spines.values():
+                    sp.set_edgecolor(th["key_edge"])
+                box.on_submit(lambda text, s=s: self._typed(s, text))
+                s.on_changed(lambda val, box=box: self._show_value(box, val))
+                self._value_boxes.append(box)
+        if self.paired:
+            ax_r = self._grid_radio.ax
+            ax_r.set_position([0.71, self.SLIDER_ROWS[4] - 0.01, 0.2, 0.11])
+            self._grid_radio.set_radio_props({"facecolor": ACCENT, "edgecolor": th["text"]})
+            for label, name in zip(self._grid_radio.labels, self.GRID_NAMES):
+                label.set_color(self._grid_text(name)); label.set_fontweight("bold")
+
+    def _grid_text(self, name):
+        """A grid's color for text on the window's theme (darker on a light window)."""
+        return GRID_TEXT["dark" if self.theme is THEMES["dark"] else "light"][name]
+
+    @staticmethod
+    def _fmt(val):
+        return f"{val:.0f}" if abs(val) >= 10 or float(val).is_integer() else f"{val:.3g}"
+
+    def _typed(self, slider, text):
+        """A value typed in a slider's box: set the slider to it (clipped to its range); a bad entry restores it."""
+        if getattr(self, "_syncing", False):
+            return
+        try:
+            val = float(text)
+        except ValueError:
+            self._show_value(None, slider.val)
+            return
+        lo, hi = slider.valmin, slider.valmax
+        slider.set_val(min(max(val, lo), hi))
+
+    def _show_value(self, box, val):
+        """Keep a slider's box showing its value (without re-submitting it)."""
+        if box is None:
+            return
+        self._syncing = True
+        try:
+            box.set_val(self._fmt(val))
+        finally:
+            self._syncing = False
+
+    def _typing(self):
+        """Whether a value box has the keyboard (its keys must not reach the hotkeys)."""
+        return any(getattr(b, "capturekeystrokes", False) for b in getattr(self, "_value_boxes", []))
 
     def _render_view(self, ax=None):
         """Show the visible region at the finest stride that keeps it within the axes' screen pixels,
@@ -581,6 +825,11 @@ class GridAdjuster:
         H, W = self.img.shape
         toolbar = getattr(self.fig.canvas, "toolbar", None)
         mode = str(getattr(toolbar, "mode", "")) if toolbar is not None else ""
+        if self._typing():   # the keys go to a value box
+            return
+        if e.key == "tab" and self.paired:
+            self.switch_grid()
+            return
         if e.key == "z" and toolbar is not None:
             if "zoom" not in mode:
                 toolbar.zoom()
@@ -754,14 +1003,16 @@ class GridAdjuster:
         icon_x, text_x = 0.2, 1.05  # inches from the panel's left edge
         wrap = int(np.clip((width - text_x - 0.2) / 0.075, 16, 30))  # characters that fit
 
-        rows = [("mouse", m) for m in KEY_MOUSE] + [("rule", None)] + [("keys", k) for k in KEY_KEYS]
+        keys = KEY_KEYS + ([("tab", "switch grids: reaction chambers / DNA chambers")] if self.paired else [])
+        mouse_rows = KEY_MOUSE if self.local_fixes else KEY_MOUSE[:1]
+        rows = [("mouse", m) for m in mouse_rows] + [("rule", None)] + [("keys", k) for k in keys]
         heights = [
             0.18 if kind == "rule"
             else max(0.42 if kind == "mouse" else 0.32, len(textwrap.wrap(item[-1], wrap)) * line + 0.12)
             for kind, item in rows
         ]
-        note = textwrap.fill(f"A fix fades out within ~{WARP_REACH} chambers; the corners stay "
-                             "put. Every change saves.", wrap + 8)
+        note = textwrap.fill((f"A fix fades out within ~{WARP_REACH} chambers; the corners stay put. " if self.local_fixes
+                              else "The grid follows its 4 corners. ") + "Every change saves.", wrap + 8)
         height = pad + 0.35 + sum(heights) + 0.1 + note.count("\n") * 0.16 + 0.3 + pad
         scale = min(1.0, (H_in - top - 0.2) / height)  # laid out at full size, then scaled to fit
         fs = lambda size: size * scale
@@ -806,6 +1057,8 @@ class GridAdjuster:
                 if kind == "mouse":
                     which, marker, color, ms, text = item
                     mouse(yc, which)
+                    if color == "white" and th is THEMES["light"]:   # the corner handle's icon, visible on a light panel
+                        color = "0.25"
                     ax.plot([icon_x + 0.5], [yc], marker, ms=ms * scale, mfc="none", mec=color, mew=1.8)
                     x = text_x
                 else:
@@ -826,7 +1079,8 @@ class GridAdjuster:
 
     def _on_toggle_masks(self, label):
         vis = self._mask_check.get_status()[0]
-        for coll in (self._roi, self._bg_in, self._bg_out, self._grid_pts):
+        for coll in ((self._roi, self._grid_pts, self._other_roi, self._necks) if self.paired
+                     else (self._roi, self._bg_in, self._bg_out, self._grid_pts)):
             coll.set_visible(vis)
         for lab in self._index_labels:
             lab.set_visible(vis)
@@ -855,7 +1109,15 @@ class GridAdjuster:
         self.vmax = float(val)
         self._apply_clim()
 
+    def _on_neck(self, val):
+        self.neck_width = float(val)
+        self._update_artists()
+        self._save_state(self._state() if self._active == "reaction" else self._grids["reaction"], "reaction")
+        self.fig.canvas.draw_idle()
+
     def _on_radius(self, val):
+        if getattr(self, "_switching", False):   # the slider follows a grid switch; nothing changed
+            return
         self.radius = self.bg_inner = int(val)  # the annulus starts at the button edge
         if self.dumbbell is not None:
             self._dumbbell_templates()
@@ -863,11 +1125,17 @@ class GridAdjuster:
         else:
             self._set_diameter(self._roi, self.radius)
             self._set_diameter(self._bg_in, self.bg_inner)
+            if self.paired:   # the necks start at the circles' edges
+                self._update_artists()
         self._persist()
         self.fig.canvas.draw_idle()
 
     def _on_bg_outer(self, val):
         self.bg_outer = int(val)
+        if self.paired:   # the dumbbell's background margin, saved with the reaction grid
+            self._save_state(self._state() if self._active == "reaction" else self._grids["reaction"], "reaction")
+            self.fig.canvas.draw_idle()
+            return
         if self.dumbbell is not None:   # the margin of the background ring beyond the outline
             self._dumbbell_templates()
             self._update_artists()
@@ -920,8 +1188,8 @@ class GridAdjuster:
             return
         if e.inaxes is not self.ax or e.xdata is None:
             return
-        # a chamber other than the corner ones: a local correction (right-click removes it)
-        rc = self._chamber_at(e.xdata, e.ydata)
+        # a chamber other than the corner ones: a local correction (right-click removes it), when local_fixes is on
+        rc = self._chamber_at(e.xdata, e.ydata) if self.local_fixes else None
         corners = {(0, 0), (0, self.n_cols - 1), (self.n_rows - 1, self.n_cols - 1), (self.n_rows - 1, 0)}
         if rc is not None and rc not in corners:
             if e.button == 3:
@@ -949,7 +1217,7 @@ class GridAdjuster:
         """The artists that follow a drag: the grid, its rings and labels, the handles and the
         local corrections."""
         return [self._grid_pts, self._roi, self._bg_in, self._bg_out, *self._index_labels,
-                self._corner_pts, *self._labels, self._ctrl_pts]
+                self._corner_pts, *self._labels, self._ctrl_pts, *([self._necks] if self.paired else [])]
 
     def _start_blit(self):
         """For a drag: draw everything once without the moving artists and keep that as the
@@ -1028,6 +1296,16 @@ class GridAdjuster:
         for lab, p in zip(self._index_labels, pts):  # index labels track their buttons
             lab.xy = p
 
+        if self.paired:
+            other = self._grids[self._other()]
+            ocx, ocy = self._state_centers(other, self.n_rows, self.n_cols)
+            self._other_roi.set_offsets(np.column_stack([ocx.ravel(), ocy.ravel()]))
+            self._set_diameter(self._other_roi, other["radius"])
+            rc_, dn_ = ((cx, cy), (ocx, ocy)) if self._active == "reaction" else ((ocx, ocy), (cx, cy))
+            r_r = self.radius if self._active == "reaction" else other["radius"]
+            r_d = other["radius"] if self._active == "reaction" else self.radius
+            self._necks.set_data(*neck_lines(rc_, dn_, r_r, r_d, self.neck_width))
+
         self._corner_pts.set_data(self.corners[:, 0], self.corners[:, 1])
         for lab, (x, y) in zip(self._labels, self.corners):
             lab.set_position((x, y))
@@ -1036,9 +1314,10 @@ class GridAdjuster:
             rc = list(self.controls)
             self._ctrl_pts.set_data([cx[r, c] for r, c in rc], [cy[r, c] for r, c in rc])
             n = len(rc)
-            self.ax.set_title(
-                "drag the cyan corners to place the grid, then any circle to fix it locally\n"
-                f"{n} local correction{'s' if n != 1 else ''}"
-                + (f" → {self.warp_path.name}" if self.warp_path else " (not saved: no warp_path)"),
-                fontsize=10,
-            )
+            what = (f"placing the {self.GRID_NAMES[self._active]}: drag its 4 white corners (Tab: the other grid)" if self.paired
+                    else "drag the 4 white corners to place the grid" + (", then any circle to fix it locally" if self.local_fixes else ""))
+            fixes = (f"\n{n} local correction{'s' if n != 1 else ''}"
+                     + (f" → {self.warp_path.name}" if self.warp_path else " (not saved: no warp_path)")) if (self.local_fixes or n) else ""
+            self.ax.set_title(what + fixes, fontsize=10.5,
+                              color=self._grid_text(self._active) if self.paired else self.theme["text"],
+                              fontweight="bold" if self.paired else "normal")

@@ -44,11 +44,11 @@ def bilinear_grid(corners, n_rows=8, n_cols=8):
     return P[..., 0], P[..., 1]
 
 
-def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None, dumbbell=None):
+def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None, dumbbell=None, extra=None):
     """Save the 4 grid corners [[x,y],...] to JSON. If any of radius/bg_inner/bg_outer is
     given, save the full mask as a dict {corners, radius, bg_inner, bg_outer}; otherwise
-    save a bare corners list. `dumbbell` (the shape, see dumbbell_mask) is saved with them.
-    Returns the path."""
+    save a bare corners list. `dumbbell` (the shape, see dumbbell_mask) is saved with them,
+    and `extra` (a dict, e.g. a paired grid's neck_width) is merged in. Returns the path."""
     import json
 
     corners = np.asarray(corners, float).tolist()
@@ -63,6 +63,7 @@ def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None, du
         }
         if dumbbell is not None:
             payload["dumbbell"] = {k: float(v) for k, v in dumbbell.items()}
+        payload.update(extra or {})
 
     Path(path).write_text(json.dumps(payload, indent=2))
     return str(path)
@@ -70,7 +71,8 @@ def save_corners(path, corners, *, radius=None, bg_inner=None, bg_outer=None, du
 
 def load_mask(path):
     """Read a saved placement -> {corners, radius, bg_inner, bg_outer, dumbbell} (missing
-    fields None). Accepts both the bare corners-list format and the full-mask dict format.
+    fields None), plus any other saved field (e.g. neck_width). Accepts both the bare
+    corners-list format and the full-mask dict format.
 
     bg_inner is always the button radius: the background annulus starts at the button's
     edge, so it is never set by hand (any saved value is ignored)."""
@@ -78,7 +80,7 @@ def load_mask(path):
 
     data = json.loads(Path(path).read_text())
     if isinstance(data, dict):
-        mask = {k: data.get(k) for k in ("corners", "radius", "bg_inner", "bg_outer", "dumbbell")}
+        mask = {**data, **{k: data.get(k) for k in ("corners", "radius", "bg_inner", "bg_outer", "dumbbell")}}
         mask["bg_inner"] = mask["radius"]
         return mask
     return {"corners": data, "radius": None, "bg_inner": None, "bg_outer": None, "dumbbell": None}

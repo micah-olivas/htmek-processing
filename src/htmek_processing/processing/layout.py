@@ -87,10 +87,26 @@ def chamber_tags(layout, n_rows=None, n_cols=None):
     return column_tags(layout, n_rows or 8)[0]
 
 
+import os as _os
+
+# how figures write an amber-suppression (TAG codon) substitution, "*" in the pinlist; worker processes (report pages,
+# fits) inherit the setting through the environment
+TAG_SUFFIX = _os.environ.get("HTMEK_TAG_SUFFIX", "tag")
+
+
+def set_tag_suffix(suffix):
+    """How figures write a TAG substitution ("*" in the pinlist): "tag" by default ("A4tag"); the amino acid it
+    incorporates on a chip that names it, e.g. "AHA" (azidohomoalanine, MBO-056: "K98AHA") or "φ" (an ester, MBO-052:
+    "F22φ"). None restores "tag". Tables keep the pinlist's names."""
+    global TAG_SUFFIX
+    TAG_SUFFIX = "tag" if suffix is None else str(suffix)
+    _os.environ["HTMEK_TAG_SUFFIX"] = TAG_SUFFIX   # worker processes started from here use it too
+
+
 def display_tag(tag):
-    """A variant's name for figures: an ester (TAG, amber-suppression) substitution, "*" in the
-    pinlist (e.g. "F22*"), is written with phi ("F22φ"). Other tags are unchanged; tables keep
-    the pinlist's names."""
+    """A variant's name for figures: a TAG (amber-suppression) substitution, "*" in the pinlist (e.g. "A4*"), is
+    written with TAG_SUFFIX ("A4tag" by default; set_tag_suffix changes it). Other tags are unchanged; tables keep the
+    pinlist's names."""
     tag = str(tag)
-    return tag[:-1] + "φ" if tag.endswith("*") else tag
+    return tag[:-1] + TAG_SUFFIX if tag.endswith("*") else tag
 

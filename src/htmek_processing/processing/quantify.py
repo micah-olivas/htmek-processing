@@ -282,6 +282,7 @@ def kinetic_traces(
     time_name="seconds",
     drop_empty=True,
     prefix=None,
+    also=(),
 ):
     """Apply one fixed grid (centers `cx`, `cy`) to every frame of a (time, y, x) stack.
 
@@ -298,7 +299,9 @@ def kinetic_traces(
     frame index. `drop_empty=True` trims trailing unused acquisition slots (seconds == 0).
 
     Frames are read one at a time, so a lazy (zarr / xarray) stack never has to fit in
-    memory as a whole."""
+    memory as a whole. `also` reads more masks on the same frames, each read once: dicts of
+    cx, cy, radius, prefix and optionally aggs (default ("median",)), adding `<prefix>_<agg>`
+    columns."""
     if stack.ndim != 3:
         raise ValueError(
             f"kinetic_traces expects a 3-D (time, y, x) stack, got shape "
@@ -335,6 +338,10 @@ def kinetic_traces(
             bg_agg=bg_agg,
             prefix=prefix,
         )
+        for m in also:   # another mask, same frame in memory
+            st = intensities_at(frame, m["cx"], m["cy"], m["radius"], m.get("aggs", ("median",)))
+            for a in m.get("aggs", ("median",)):
+                d[f"{m['prefix']}_{a}"] = np.asarray(st[a]).ravel()
         d.insert(0, "frame", t)
         # per-frame time broadcasts to every chamber; per-chamber time ravels row-major,
         # which matches centers_to_df's row order
@@ -430,6 +437,10 @@ def fit_bleaching(traces, value="median", *, ref_tags=("BLANK",), by="frame",
         rising = slope[slope > max_slope].index
         n_left_out = len(rising)
         ref = ref[~ref.set_index(keys).index.isin(rising)]
+    if ref.empty:   # every reference chamber rising: no bleaching can be modeled (n_ref 0, the curve flat)
+        frames = sorted(traces[by].unique())
+        return dict(amplitude=0.0, rate=0.0, floor=1.0, curve={f: 1.0 for f in frames}, median={},
+                    n_ref=0, n_left_out=n_left_out)
     med = ref.groupby(by)["_rel"].median()
     steps = med.index.to_numpy(float)
     n = steps - steps.min()
@@ -449,7 +460,7 @@ def fit_bleaching(traces, value="median", *, ref_tags=("BLANK",), by="frame",
 
 
 def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=None,
-                       aggs=("median", "mean", "sum"), prefix=None, name=None):
+                       aggs=("median", "mean", "sum"), prefix=None, name=None, also=()):
     """Per-timepoint intensities of every chamber of a kinetic run, the standard readout:
     one row per chamber x frame with `seconds` (the time of the tile the chamber's center
     falls in, since the run started: chambers in one pass are imaged up to a pass apart),
@@ -462,13 +473,14 @@ def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=N
     `tile_px` the stitched tile pitch (the store's attrs['tile_px']). `prefix` names the
     columns by mask, as centers_to_df's (e.g. "chamber_ROI": `chamber_ROI_median`,
     `chamber_ROI_median_minus_frame0`). `name` (e.g. the run) records the readout as a
-    step of the pipeline's record (analysis.steps), one item per name."""
+    step of the pipeline's record (analysis.steps), one item per name. `also`: more masks read
+    on the same frames (kinetic_traces)."""
     from .stitch import chamber_seconds
 
     seconds = chamber_seconds(tiled["seconds"].values, cx, cy, tile_px)
     inner, outer = ring if ring is not None else (None, None)
     df = kinetic_traces(stack, cx, cy, columns, radius=radius, aggs=aggs, bg=ring is not None,
-                        bg_inner=inner, bg_outer=outer, seconds=seconds, drop_empty=False, prefix=prefix)
+                        bg_inner=inner, bg_outer=outer, seconds=seconds, drop_empty=False, prefix=prefix, also=also)
     keys = ["mark_row", "mark_col"]
     first = df[df["frame"] == df["frame"].min()].set_index(keys)
     idx = df.set_index(keys).index
@@ -481,27 +493,51 @@ def chamber_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, ring=N
     return df
 
 
-def dumbbell_intensities(image, cx, cy, columns, *, radius, dumbbell, ring=(2.0, 10.0), prefix="dumbbell"):
+from functools import lru_cache
+
+
+@lru_cache(maxsize=None)
+def _dumbbell_stamps(radius, dna_dx, dna_dy, dna_radius, neck_width, gap, outer):
+    """A dumbbell's stamp and its background band (dumbbell_intensities), cached: with one DNA-chamber offset per
+    chamber (a paired grid), each chamber's stamps are built once and reused on every image."""
+    from .grid import dumbbell_mask
+
+    shape = dict(dna_dx=dna_dx, dna_dy=dna_dy, dna_radius=dna_radius, neck_width=neck_width)
+    stamp, offset = dumbbell_mask(radius, shape)
+    if gap is None:
+        return stamp, offset, None, None
+    near, (nx, ny) = dumbbell_mask(radius, shape, margin=gap)
+    far, (fx, fy) = dumbbell_mask(radius, shape, margin=outer)
+    band = far.copy()
+    band[ny - fy:ny - fy + near.shape[0], nx - fx:nx - fx + near.shape[1]] &= ~near
+    return stamp, offset, band, (fx, fy)
+
+
+def dumbbell_intensities(image, cx, cy, columns, *, radius, dumbbell, ring=(2.0, 10.0), prefix="dumbbell",
+                         dna_x=None, dna_y=None):
     """One image's intensity over each chamber's dumbbell (grid.dumbbell_mask: the reaction
     chamber, of `radius`, its DNA chamber and the neck between them), one row per chamber:
     mark_row, mark_col, tag, x, y (the reaction chamber's center), and <prefix>_sum, _mean,
     _n_px over the dumbbell; with `ring` = (gap, outer) px, the median of a ring around the
     outline from `gap` to `outer` px out (<prefix>_bg) and <prefix>_sum_net = sum - bg x
     n_px. Centers are rounded to whole pixels; pixels off the image or NaN (tiles never
-    acquired) are left out, and a dumbbell with none left reads NaN."""
-    from .grid import dumbbell_mask
+    acquired) are left out, and a dumbbell with none left reads NaN.
 
+    `dna_x`, `dna_y` (arrays shaped like cx): each chamber's own DNA-chamber center (a paired grid, GridAdjuster
+    `dna=`), instead of one dumbbell["dna_dx"], ["dna_dy"] for every chamber; the neck joins each chamber's two
+    centers. The offsets are rounded to whole pixels."""
     image = np.asarray(image, float)
     H, W = image.shape
-    stamp, (sx, sy) = dumbbell_mask(radius, dumbbell)
     gap, outer = ring if ring is not None else (None, None)
-    if ring is not None:
-        near, (nx, ny) = dumbbell_mask(radius, dumbbell, margin=gap)
-        far, (fx, fy) = dumbbell_mask(radius, dumbbell, margin=outer)
-        # the ring, on the far stamp's grid: within `outer` of the outline, beyond `gap`
-        band = far.copy()
-        band[ny - fy:ny - fy + near.shape[0], nx - fx:nx - fx + near.shape[1]] &= ~near
+    r_dna, neck = float(dumbbell["dna_radius"]), float(dumbbell["neck_width"])
     cx, cy = np.asarray(cx, float), np.asarray(cy, float)
+    per_chamber = dna_x is not None
+    if per_chamber:
+        odx = np.rint(np.asarray(dna_x, float) - cx)
+        ody = np.rint(np.asarray(dna_y, float) - cy)
+    else:
+        stamp, (sx, sy), band, fxy = _dumbbell_stamps(float(radius), float(dumbbell["dna_dx"]), float(dumbbell["dna_dy"]),
+                                                      r_dna, neck, gap, outer)
     tags = chamber_tags(columns, *cx.shape)
 
     def window(x, y, mask, ox, oy):
@@ -518,12 +554,14 @@ def dumbbell_intensities(image, cx, cy, columns, *, radius, dumbbell, ring=(2.0,
     rows = []
     for (r, c), x in np.ndenumerate(cx):
         y = cy[r, c]
+        if per_chamber:
+            stamp, (sx, sy), band, fxy = _dumbbell_stamps(float(radius), float(odx[r, c]), float(ody[r, c]), r_dna, neck, gap, outer)
         v = window(x, y, stamp, sx, sy)
         rec = {"mark_row": r, "mark_col": c, "tag": tags[r, c], "x": x, "y": y,
                f"{prefix}_sum": v.sum() if v.size else np.nan, f"{prefix}_mean": v.mean() if v.size else np.nan,
                f"{prefix}_n_px": v.size}
         if ring is not None:
-            b = window(x, y, band, fx, fy)
+            b = window(x, y, band, *fxy)
             rec[f"{prefix}_bg"] = np.median(b) if b.size else np.nan
             rec[f"{prefix}_sum_net"] = rec[f"{prefix}_sum"] - rec[f"{prefix}_bg"] * v.size
         rows.append(rec)
@@ -531,21 +569,23 @@ def dumbbell_intensities(image, cx, cy, columns, *, radius, dumbbell, ring=(2.0,
 
 
 def dumbbell_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, dumbbell, ring=(2.0, 10.0),
-                        prefix="dumbbell", name=None):
+                        prefix="dumbbell", name=None, dna_x=None, dna_y=None):
     """Per-pass dumbbell intensities of every chamber of a kinetic run (dumbbell_intensities
     at each frame of the (time, y, x) `stack`), one row per chamber x frame, with `frame`,
     `seconds` (the time of the tile the reaction chamber's center falls in, as
     chamber_timecourse) and each column minus the chamber's frame-0 value (<col>_minus_frame0).
     The readout for something in solution across both chambers, e.g. GFP while it is
     expressed in the DNA chamber and moves through the neck. `name` records the readout as a
-    step of the pipeline's record (analysis.steps)."""
+    step of the pipeline's record (analysis.steps). `dna_x`, `dna_y`: each chamber's DNA-chamber center (a paired
+    grid), as dumbbell_intensities."""
     from .stitch import chamber_seconds
 
     seconds = chamber_seconds(tiled["seconds"].values, cx, cy, tile_px)
     parts = []
     for k in range(stack.shape[0]):
         frame = np.asarray(stack[k], np.float32)
-        d = dumbbell_intensities(frame, cx, cy, columns, radius=radius, dumbbell=dumbbell, ring=ring, prefix=prefix)
+        d = dumbbell_intensities(frame, cx, cy, columns, radius=radius, dumbbell=dumbbell, ring=ring, prefix=prefix,
+                                 dna_x=dna_x, dna_y=dna_y)
         d.insert(0, "frame", k)
         d["seconds"] = seconds[k].ravel()
         parts.append(d)
@@ -560,7 +600,8 @@ def dumbbell_timecourse(stack, cx, cy, columns, tiled, tile_px, *, radius, dumbb
 
         tally_step(f"dumbbell_timecourse_{prefix}", "Read every pass per dumbbell",
                    [f"sum over the reaction chamber ({radius:g} px), its DNA chamber",
-                    f"({dumbbell['dna_radius']:g} px, {dumbbell['dna_dx']:g}, {dumbbell['dna_dy']:g} px away) and the neck "
+                    f"({dumbbell['dna_radius']:g} px, " + ("placed per chamber" if dna_x is not None else
+                                                         f"{dumbbell['dna_dx']:g}, {dumbbell['dna_dy']:g} px away") + ") and the neck "
                     f"({dumbbell['neck_width']:g} px)"]
                    + ([f"local background: median of a {ring[0]:g}–{ring[1]:g} px ring around it"] if ring else [])
                    + [f"{cx.size:,} chambers, every pass"],
