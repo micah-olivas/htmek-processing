@@ -62,6 +62,8 @@ from .processing.stitch import (  # noqa: F401
 from .processing.protocol_log import read_protocol_log, protocol_summary  # noqa: F401
 from .processing.provenance import record_raw_source, write_raw_readme  # noqa: F401
 from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure  # noqa: F401
+from .analysis.expression import expression_calls, blank_leakage, dna_chamber_diffusion, diffusion_figure  # noqa: F401
+from .report.expression import expression_report  # noqa: F401
 from .processing.grid import (  # noqa: F401
     grid_centers,
     bilinear_grid,
@@ -240,10 +242,15 @@ __all__ = [
     "fit_flatfield",
     "stitch_run",
     "record_raw_source",
+    "expression_calls",
+    "blank_leakage",
+    "dna_chamber_diffusion",
     "tile_medians",
     "tile_deviations",
     "tile_of",
     "tile_figure",
+    "diffusion_figure",
+    "expression_report",
     "write_raw_readme",
     "tile_seam_flags",
     "chamber_seconds",
