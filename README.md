@@ -66,6 +66,25 @@ as `hr.<name>` (`from htmek_processing import report as hr`). Import from a subm
 
 ## Usage
 
+### Starting an experiment
+
+The process and analysis notebook templates ship with the package (`htmek_processing/templates/`). This writes an
+experiment's `1-Process.ipynb` and `2-Analysis.ipynb` from them and creates the standard folders:
+
+```python
+import htmek_processing as hp
+
+hp.create_experiment_notebooks(
+    "path/to/experiment",                                    # the local workup folder
+    "MBO-057",                                               # fills EXPERIMENT
+    drive="/Volumes/Data_T7/HTMEK-data/uVAST/MBO-057-...",   # the raw and stitched images
+    pinlist="../_config/_pinlists/<pinlist>.csv",                    # the print's pinlist
+)
+```
+
+The header markdown is left for the experiment's description; the Configure cell lists the scans (expression time course,
+SDS washes, standards, assay runs), and a list left empty skips its section. An existing notebook is not overwritten.
+
 ### In a notebook
 
 The package exposes every name at the top level, making all utilities available from a single import:
