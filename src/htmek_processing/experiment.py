@@ -1,0 +1,708 @@
+"""One experiment's processing, step by step: the process notebook's Configure cell feeds an `Experiment`, and each
+step is one method call that writes its tables and QC figures (htmek_processing/templates/process.ipynb).
+
+    exp = hp.Experiment.from_config(globals())
+    exp.stitch_all()
+    exp.place_dumbbells(); exp.center_dumbbells(); exp.quantify_expression()
+    exp.find_buttons(); exp.quantify_buttons()
+    exp.place_chambers(); exp.quantify_assay(); exp.quantify_standards()
+
+Raw images to intensities only: nothing is fitted or filtered here (the analysis notebook does that)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+KEYS = ["mark_row", "mark_col"]
+
+
+def _in_notebook():
+    try:
+        return get_ipython().__class__.__name__ == "ZMQInteractiveShell"   # noqa: F821
+    except NameError:
+        return False
+
+
+def note(text):
+    """A one-line step summary: Markdown in a notebook (bold allowed), plain text elsewhere."""
+    if _in_notebook():
+        from IPython.display import Markdown, display
+
+        display(Markdown(text))
+    else:
+        print(text.replace("**", ""))
+
+
+def table(df, caption=None, fmt=None):
+    """A small summary table: styled in a notebook (one number format, no index clutter), plain text elsewhere."""
+    df = df.rename_axis(index=None, columns=None)   # no extra header row for the index's name
+    if _in_notebook():
+        from IPython.display import display
+
+        sty = df.style.format(fmt or "{:,.0f}", na_rep="–")
+        if caption:
+            sty = sty.set_caption(caption).set_table_styles([{"selector": "caption", "props": "caption-side: top; text-align: left; font-weight: bold; padding-bottom: 4px;"}])
+        display(sty)
+    else:
+        if caption:
+            print(caption)
+        print(df.to_string(float_format=lambda v: f"{v:,.1f}"))
+
+
+def _ctrl_counts(tags):
+    n = lambda t: int((tags == t).sum())
+    tag = int(np.char.endswith(tags.astype(str), "*").sum())
+    return n("WT"), n("N41A"), n("BLANK"), tag
+
+# the Configure cell's names -> Experiment fields
+CONFIG_NAMES = {
+    "EXPERIMENT": "experiment", "LIBRARY": "library", "EXPERIMENT_DATE": "date", "DRIVE": "drive", "CAMERA": "camera",
+    "MAX_CROSS_PX": "max_cross_px", "EXPRESSION_DIR": "expression_dir", "EXPRESSION": "expression",
+    "GFP_BACKGROUND": "gfp_background", "SDS_WASHES": "sds_washes", "STANDARDS": "standards", "ASSAY_DIR": "assay_dir",
+    "ASSAY_RUNS": "assay_runs", "SUBSTRATE": "substrate", "SEAM_SCAN": "seam_scan", "FLATFIELD_SCAN": "flatfield_scan",
+    "N_ROWS": "n_rows", "N_COLS": "n_cols", "PINLIST_FILE": "pinlist_file", "MIRROR_COLS": "mirror_cols",
+    "REACTION_R": "reaction_r", "DNA_R": "dna_r", "DNA_OFFSET": "dna_offset", "NECK_WIDTH": "neck_width",
+    "DUMBBELL_BG": "dumbbell_bg", "BUTTON_R": "button_r", "BUTTON_RING": "button_ring", "CHAMBER_R": "chamber_r",
+    "CHAMBER_RING": "chamber_ring", "CENTER_REACH": "center_reach", "BUTTON_REACH": "button_reach",
+    "BUTTON_SPOT_R": "button_spot_r", "SEED_CORNERS": "seed_corners", "PLACE_DUMBBELLS": "open_dumbbell_window",
+    "PLACE_CHAMBERS": "open_chamber_window",
+    "TAG_SUFFIX": "tag_suffix",
+}
+
+
+@dataclass
+class Experiment:
+    """An experiment's settings (the process notebook's Configure cell), its folders, its pinlist, and the steps that
+    turn its raw images into intensities. Build it with `Experiment.from_config(globals())`. Paths are relative to the
+    notebook's folder; the raw and stitched images are under `drive`."""
+
+    experiment: str
+    drive: Path
+    pinlist_file: str
+    camera: dict
+    library: str = "LIBRARY"
+    date: str = ""
+    max_cross_px: float = 25.0
+    expression_dir: str = "GFP/expression-time-course"
+    expression: dict = field(default_factory=dict)
+    gfp_background: tuple = ("GFP", "gfp_bg_kinetix_500ms")
+    sds_washes: dict = field(default_factory=dict)
+    standards: dict = field(default_factory=dict)
+    assay_dir: str = "Assays"
+    assay_runs: dict = field(default_factory=dict)
+    substrate: str = "bzp_uM"
+    seam_scan: str | None = None
+    flatfield_scan: str | None = None
+    n_rows: int = 56
+    n_cols: int = 32
+    mirror_cols: bool = True
+    reaction_r: float = 90
+    dna_r: float = 65
+    dna_offset: tuple = (234, 0)
+    neck_width: float = 36
+    dumbbell_bg: float = 18
+    button_r: float = 34
+    button_ring: tuple = (38, 52)
+    chamber_r: float = 65
+    chamber_ring: tuple = (95, 115)
+    center_reach: int = 30
+    button_reach: int = 30
+    button_spot_r: float = 20
+    seed_corners: str | None = None
+    open_dumbbell_window: bool | None = None   # None: open each grid window until its corners files exist
+    open_chamber_window: bool | None = None
+    tag_suffix: str | None = None   # how figures write a TAG ("*") substitution: None "A4tag"; e.g. "AHA": "A4AHA"
+
+    # ------------------------------------------------------------------ setup
+    @classmethod
+    def from_config(cls, namespace, **overrides):
+        """An Experiment from the Configure cell's names (pass `globals()`); `overrides` set any field directly."""
+        kw = {f: namespace[n] for n, f in CONFIG_NAMES.items() if n in namespace}
+        kw.update(overrides)
+        return cls(**kw)
+
+    def __post_init__(self):
+        import matplotlib.pyplot as plt
+
+        from .analysis.plots import set_plot_style
+        from .processing.layout import chamber_tags, mirror_pinlist
+
+        import logging
+
+        from .processing.layout import set_tag_suffix
+
+        set_plot_style()
+        set_tag_suffix(self.tag_suffix)
+        plt.rcParams.update({"figure.facecolor": "white", "savefig.facecolor": "white"})
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)   # Arial's weights: harmless, but noisy
+        self.drive = Path(self.drive)
+        if not self.drive.exists():
+            raise FileNotFoundError(f"{self.drive} not found: is the T7 plugged in?")
+        self.raw, self.stitched = self.drive / "1_raw-images", self.drive / "3_stitched"
+        self.config, self.masks, self.intermediate = Path("0_config"), Path("2_masks"), Path("3_intermediate")
+        self.exports, self.figures, self.raw_record = Path("4_exports"), Path("5_figures"), Path("1_raw-images")
+        for d in (self.config, self.masks, self.intermediate, self.exports, self.figures):
+            d.mkdir(parents=True, exist_ok=True)
+        self.pinlist = mirror_pinlist(self.pinlist_file, n_cols=self.n_cols) if self.mirror_cols else pd.read_csv(self.pinlist_file)
+        self.tags = chamber_tags(self.pinlist, self.n_rows, self.n_cols)
+        # every scan: key (its folder under 1_raw-images) -> flatfield-corrected? Assays and standards never are
+        self.scans = {**{f"{self.expression_dir}/{n}": True for n in self.expression},
+                      **({"/".join(self.gfp_background): True} if (self.sds_washes or self.expression) else {}),
+                      **{w: True for w in self.sds_washes},
+                      **{f"Standards/{cam}/{n}": False for cam, runs in self.standards.items() for n in runs},
+                      **{f"{self.assay_dir}/{n}": False for n in self.assay_runs}}
+        self.seam_scan = self.seam_scan or next(iter(self.scans), None)
+        self.flatfield_scan = self.flatfield_scan or self.seam_scan
+        self.stores = {}
+        self.expression_keys = [f"{self.expression_dir}/{n}" for n in sorted(self.expression, key=self.expression.get)]
+        self.button_scan = list(self.sds_washes)[-1] if self.sds_washes else None
+        self.reference_run = f"{self.assay_dir}/{max(self.assay_runs, key=self.assay_runs.get)}" if self.assay_runs else None
+        # the mask files
+        m = self.masks
+        self.reaction_corners, self.reaction_warp = m / "reaction_chamber_corners.json", m / "reaction_chamber_warp.json"
+        self.dna_corners, self.dna_warp = m / "dna_chamber_corners.json", m / "dna_chamber_warp.json"
+        self.chamber_corners, self.chamber_warp = m / "assay_chamber_corners.json", m / "assay_chamber_warp.json"
+        wt, n41a, blank, tag = _ctrl_counts(self.tags)
+        groups = {"expression": len(self.expression), "background": int(bool(self.sds_washes or self.expression)),
+                  "SDS washes": len(self.sds_washes), "standards": sum(len(r) for r in self.standards.values()),
+                  "assay runs": len(self.assay_runs)}
+        note(f"**{self.experiment}** · {self.tags.size:,} chambers, {len(pd.unique(self.tags.ravel()))} tags "
+             f"({wt} WT, {n41a} N41A, {blank} BLANK" + (f", {tag:,} TAG" if tag else "") + ") · "
+             f"{len(self.scans)} scans: " + ", ".join(f"{v} {k}" for k, v in groups.items() if v))
+
+    def __repr__(self):
+        return f"Experiment({self.experiment}, {len(self.scans)} scans, drive={self.drive})"
+
+    def save_fig(self, fig, folder, name, show=True, **kw):
+        """Save a QC figure in 5_figures/qc/<folder>/<name> (PDF and PNG, or `exts=`), show it inline, close it."""
+        import matplotlib.pyplot as plt
+
+        from .analysis.plots import save_qc_fig
+
+        save_qc_fig(fig, folder, name, **kw)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    @staticmethod
+    def place(flag, *corners):
+        """Whether a grid window opens: the flag, or (None) until every one of its corners files exists."""
+        return flag or (flag is None and not all(Path(c).exists() for c in corners))
+
+    @staticmethod
+    def _interactive():
+        """Switch the notebook to a desktop window for a grid (`%matplotlib qt`), when in IPython."""
+        try:
+            get_ipython().run_line_magic("matplotlib", "qt")   # noqa: F821
+        except NameError:
+            pass
+
+    @staticmethod
+    def _inline():
+        try:
+            get_ipython().run_line_magic("matplotlib", "inline")   # noqa: F821
+        except NameError:
+            pass
+
+    # ------------------------------------------------------------------ 1. stitch
+    def stitch(self, key):
+        """One scan: the shared seams, the camera's offset and rotation; the GFP flatfield where `scans` says so."""
+        from .processing.stitch import stitch_run
+
+        raw = self.raw / key
+        raw = raw if raw.exists() else self.drive / key   # a download that landed beside 1_raw-images
+        flat = self.config / f"flatfield_basic_{Path(self.flatfield_scan).name}.tif" if self.scans[key] else None
+        self.stores[key] = stitch_run(raw, self.stitched / f"{key}.zarr", camera=self.camera,
+                                      geometry_path=self.intermediate / f"stitch_geometry_{Path(self.seam_scan).name}.json",
+                                      flatfield_path=flat, max_cross_px=self.max_cross_px, record_dir=self.raw_record)
+        return self.stores[key]
+
+    def image(self, key):
+        """A scan's stitched image (the last pass of a time series), float32."""
+        if key not in self.stores:   # stitched already: reopens it
+            self.stitch(key)
+        da = self.stores[key]["image"]
+        da = da.isel(time=-1) if "time" in da.dims else da   # select the pass first: never load the whole series
+        return np.asarray(da.values, dtype=np.float32)
+
+    def stitch_all(self):
+        """Stitch every scan: the seam scan first (its seams measured, the GFP flatfield fit on `flatfield_scan`), then
+        every other scan reusing both; existing stores are reopened. QC: every tile corner on the seam scan."""
+        from .analysis.plots import show_seams
+
+        for k in sorted(self.scans, key=lambda k: (k != self.seam_scan, k != self.flatfield_scan)):
+            self.stitch(k)
+        groups = {"expression time course": [f"{self.expression_dir}/{n}" for n in self.expression],
+                  "GFP background": ["/".join(self.gfp_background)] if "/".join(self.gfp_background) in self.scans else [],
+                  "SDS washes": list(self.sds_washes),
+                  **{f"standards, {cam}": [f"Standards/{cam}/{n}" for n in runs] for cam, runs in self.standards.items()},
+                  "assay runs": [f"{self.assay_dir}/{n}" for n in self.assay_runs]}
+        labels = {**{f"{self.expression_dir}/{n}": f"{m:g} min" for n, m in self.expression.items()}, **self.sds_washes,
+                  **{f"Standards/{cam}/{n}": f"{c:g} µM" for cam, runs in self.standards.items() for n, c in runs.items()},
+                  **{f"{self.assay_dir}/{n}": f"{c:g} µM" for n, c in self.assay_runs.items()}}
+        rows = []
+        for g, keys in groups.items():
+            if not keys:
+                continue
+            z = [self.stores[k]["image"].sizes for k in keys]
+            sizes = sorted({f"{d['y']:,} x {d['x']:,}" for d in z})
+            rows.append({"": g, "scans": len(keys), "which": ", ".join(labels.get(k, Path(k).name) for k in keys) if len(keys) > 1 or g.startswith(("expression", "SDS")) else Path(keys[0]).name,
+                         "passes": "/".join(sorted({str(d.get("time", 1)) for d in z})), "size (px)": "; ".join(sizes),
+                         "flatfield": "yes" if self.scans[keys[0]] else "no"})
+        geo = self.stores[self.seam_scan]["geometry"]
+        note(f"**Stitched {len(self.scans)} scans** · seams from `{Path(self.seam_scan).name}` (neighbors across a seam: "
+             f"{abs(geo.get('cross_dy', 0)):.1f}, {abs(geo.get('cross_dx', 0)):.1f} px apart); flatfield from `{Path(self.flatfield_scan).name}`; "
+             "raw sources recorded in `1_raw-images/`")
+        table(pd.DataFrame(rows).set_index(""), fmt={"scans": "{:,.0f}"})
+        s = self.stores[self.seam_scan]
+        self.save_fig(show_seams(self.image(self.seam_scan), s["store"].attrs["seams_y"], s["store"].attrs["seams_x"],
+                                 title=f"every tile corner, {self.seam_scan}"), "1_stitch", "1a_seams")
+        self.write_scan_index()
+
+    def write_scan_index(self):
+        """4_exports/stitched_scans.json: every scan's label, stitched store, tile pitch and passes, and the masks' files
+        and radii, so the analysis notebook (its chamber report) can find the images."""
+        import json
+
+        scans = {self._label(k): dict(key=k, store=str((self.stitched / f"{k}.zarr").resolve()),
+                                      tile_px=list(self.stores[k]["store"].attrs["tile_px"]) if k in self.stores else None,
+                                      kind="assay" if k.startswith(self.assay_dir) else "standards" if k.startswith("Standards") else "GFP")
+                 for k in self.scans}
+        masks = dict(button=dict(centers=str(self.masks / "button_centers.csv"), radius=self.button_r),
+                     chamber=dict(centers=str(self.masks / "assay_chamber_centers.csv"), radius=self.chamber_r),
+                     reaction=dict(centers=str(self.masks / "reaction_chamber_centers.csv"), radius=self.reaction_r),
+                     dna=dict(centers=str(self.masks / "dna_chamber_centers.csv"), radius=self.dna_r))
+        (self.exports / "stitched_scans.json").write_text(json.dumps(dict(experiment=self.experiment, scans=scans, masks=masks,
+                                                                          button_scan=self._label(self.button_scan) if self.button_scan else None,
+                                                                          reference_run=self._label(self.reference_run) if self.reference_run else None), indent=1))
+
+    def _label(self, key):
+        labels = {**{f"{self.expression_dir}/{n}": f"expression {m:g} min" for n, m in self.expression.items()},
+                  "/".join(self.gfp_background): "GFP background", **self.sds_washes,
+                  **{f"Standards/{cam}/{n}": f"standard {c:g} µM ({cam})" for cam, runs in self.standards.items() for n, c in runs.items()},
+                  **{f"{self.assay_dir}/{n}": f"assay {c:g} µM" for n, c in self.assay_runs.items()}}
+        return labels.get(key, Path(key).name)
+
+    def check_tiles(self, n_sd=5.0, min_deviation=0.02, stride=8):
+        """Every tile's median pixel on every scan (every pass of an assay), against that tile's usual share of the scan
+        (its median over the scans of the same kind: the expression and background scans, the SDS washes, the assay
+        passes, the standards); a tile
+        off by more than `n_sd` robust SDs of every tile's deviation is flagged (hp.tile_deviations; 5, since hundreds of
+        tiles are tested: 3 would flag a few by chance) and by at least `min_deviation` (2%: tiles agree within
+        ~0.3% on a good scan). A flagged tile is
+        an acquisition problem on that scan (a darker or brighter tile), not chip content. Writes
+        4_exports/qc/tile_medians.csv (the analysis notebook flags buttons and chambers in a flagged tile). QC:
+        1_stitch/1b_tile_check."""
+        from .processing.tiles import tile_deviations, tile_figure, tile_medians
+
+        # a scan's medians are reused from the last check while its stitched store is unchanged
+        old_path = self.exports / "qc/tile_medians.csv"
+        old = pd.read_csv(old_path) if old_path.exists() else None
+        parts, reused = [], 0
+        for k, flat in self.scans.items():
+            kind = ("assay" if k.startswith(self.assay_dir) else "standards" if k.startswith("Standards")
+                    else "SDS washes" if k in self.sds_washes else "GFP" if flat else "other")   # washes: less GFP, their own pattern
+            f = self.stitched / f"{k}.zarr" / "zarr.json"
+            mtime = round(f.stat().st_mtime) if f.exists() else -1
+            prev = old[(old["key"] == k) & (old["store_mtime"] == mtime)] if old is not None and "store_mtime" in old else None
+            if prev is not None and len(prev):
+                parts.append(prev[["scan", "frame", "tile_row", "tile_col", "y0", "y1", "x0", "x1", "median", "key", "store_mtime"]]
+                             .assign(group=kind))
+                reused += 1
+                continue
+            if k not in self.stores:
+                self.stitch(k)
+            parts.append(tile_medians(self.stores[k], scan=self._label(k), frames="all" if kind == "assay" else "last",
+                                      stride=stride).assign(key=k, group=kind, store_mtime=mtime))
+        dev = tile_deviations(pd.concat(parts, ignore_index=True), n_sd=n_sd, min_deviation=min_deviation)
+        (self.exports / "qc").mkdir(parents=True, exist_ok=True)
+        dev.to_csv(self.exports / "qc/tile_medians.csv", index=False)
+        self.tiles = dev
+        bad = dev[dev["flagged"]].sort_values("deviation", key=abs, ascending=False)
+        d = dev["deviation"]
+        spread = 100 * 1.4826 * (d - d.median()).abs().median()
+        note(f"**Tile check** · {dev[['scan', 'frame']].drop_duplicates().shape[0]} scans and passes x "
+             f"{dev[['tile_row', 'tile_col']].drop_duplicates().shape[0]} tiles · typical deviation {spread:.2f}% (robust SD) · "
+             f"{len(bad)} flagged (off by > {max(n_sd * spread, 100 * min_deviation):.1f}%: {n_sd:g} robust SD, at least {100 * min_deviation:g}%) · "
+             f"{len(parts) - reused} scans read, {reused} unchanged since the last check · "
+             "`4_exports/qc/tile_medians.csv`")
+        if len(bad):
+            table(pd.DataFrame({"scan": bad["scan"], "pass": bad["frame"] + 1, "tile (row, col)": [f"{r + 1}, {c + 1}" for r, c in zip(bad["tile_row"], bad["tile_col"])],
+                                "deviation (%)": 100 * bad["deviation"]}).head(20).set_index("scan"),
+                  caption="flagged tiles, largest first (rows and columns of the tile grid, from the top left)",
+                  fmt={"pass": "{:,.0f}", "deviation (%)": "{:+.1f}"})
+        self.save_fig(tile_figure(dev), "1_stitch", "1b_tile_check")
+
+    # ------------------------------------------------------------------ 2. expression time course
+    def place_dumbbells(self, force=None):
+        """The reaction- and DNA-chamber grids (one window, Tab switches), on the time course's last scan. Opens until
+        both corners files exist (or as `force` / `open_dumbbell_window` says); blocks until the window is closed."""
+        from .processing.grid import load_mask
+        from .processing.grid_adjuster import GridAdjuster
+
+        flag = self.open_dumbbell_window if force is None else force
+        if not self.expression_keys or not self.place(flag, self.reaction_corners, self.dna_corners):
+            return
+        self._interactive()
+        seed = None if self.reaction_corners.exists() or not self.seed_corners else load_mask(self.seed_corners)["corners"]
+        gd = GridAdjuster(self.stores[self.expression_keys[-1]]["image"], columns=self.pinlist, frame=-1, corners=seed,
+                          radius=self.reaction_r, bg_outer=self.dumbbell_bg, corners_path=self.reaction_corners,
+                          warp_path=self.reaction_warp, vmax_pct=99.5, neck_width=self.neck_width,
+                          dna=dict(corners_path=self.dna_corners, warp_path=self.dna_warp, radius=self.dna_r, offset=self.dna_offset))
+        self._inline()
+        self.dumbbell_window = gd
+
+    def _visible(self, image, x, y, r, inner, outer, tags):
+        """Where a disc stands out: its median minus a ring's, above the BLANKs' median + 3 SD of that contrast."""
+        from .processing.quantify import centers_to_df
+
+        t = centers_to_df(x, y, self.pinlist, img=image, radius=r, aggs=("median",), bg=True, bg_inner=inner, bg_outer=outer)
+        contrast = (t["median"] - t["bg"]).to_numpy().reshape(np.shape(x))
+        blank = contrast[tags == "BLANK"]
+        return contrast > np.median(blank) + 3 * np.std(blank)
+
+    def _centering_qc(self, image, grid, centered, r, ok, fill, folder, name, title, half):
+        from .analysis.plots import centering_examples
+
+        d = np.hypot(centered[0] - grid[0], centered[1] - grid[1])
+        rng = np.random.default_rng(0)
+        first = sorted(map(tuple, np.argwhere(ok)), key=lambda k: -d[k])[:8] if name.endswith("chambers") else \
+            [tuple(k) for k in rng.permutation(np.argwhere(ok))[:8]]
+        groups = [("largest moves" if name.endswith("chambers") else "centered", first),
+                  ("random" if name.endswith("chambers") else "from neighbors",
+                   [tuple(k) for k in rng.permutation(np.argwhere(ok if name.endswith("chambers") else fill))[:8]])]
+        self.save_fig(centering_examples(image, grid, centered, r, self.tags, groups, half=half, ncols=8, title=title),
+                      folder, name, dpi=130)
+
+    def center_dumbbells(self):
+        """Center each reaction and DNA chamber on the last expression scan (`center_reach` px, hp.center_on_disc_sum); a
+        fit counts only where the chamber stands out from the ring around it (above the BLANKs' median + 3 SD of that
+        contrast), and the rest take their neighbors' shift. Writes 2_masks/<reaction|dna>_chamber_centers.csv. QC:
+        examples, the placed grid dashed and the centered circle solid. The centers are kept in `exp.centered`."""
+        from .processing.grid import center_on_disc_sum, load_mask, save_centers, shift_from_neighbors, warped_grid
+
+        if not self.expression_keys:
+            return None
+        img = self.image(self.expression_keys[-1])
+        self.centered, rows, qc = {}, [], []
+        for name, corners, warp in (("reaction", self.reaction_corners, self.reaction_warp), ("dna", self.dna_corners, self.dna_warp)):
+            r = load_mask(corners)["radius"]
+            gx, gy = warped_grid(corners, warp, self.n_rows, self.n_cols)
+            sx, sy, ok = center_on_disc_sum(img, gx, gy, r, reach=self.center_reach)
+            ok &= self._visible(img, sx, sy, r, r + 4, r + 20, self.tags)
+            fx, fy, fill = shift_from_neighbors(gx, gy, sx, sy, ok)
+            save_centers(self.masks / f"{name}_chamber_centers.csv", fx, fy, np.select([ok, fill], ["fit", "neighbors"], "grid"))
+            d = np.hypot(fx - gx, fy - gy)
+            rows.append({"": f"{'DNA' if name == 'dna' else name} chambers", "radius (px)": r, "fit": ok.sum(), "from neighbors": fill.sum(),
+                         "grid": (~ok & ~fill).sum(), "moved, median (px)": np.median(d), "90th (px)": np.percentile(d, 90),
+                         "max (px)": d.max()})
+            qc.append((img, (gx, gy), (fx, fy), r, ok, fill, "2_expression", f"2b_centering_{name}_chambers",
+                       f"{name} chambers centered on the last expression scan: dashed the placed grid, solid the centered circle",
+                       int(1.6 * r)))
+            self.centered[name] = (fx, fy)
+        note(f"**Centered the dumbbells** on `{Path(self.expression_keys[-1]).name}` (search ±{self.center_reach} px); "
+             "a fit counts where the chamber stands out from its ring (BLANK median + 3 SD)")
+        table(pd.DataFrame(rows).set_index(""), fmt={"radius (px)": "{:.0f}", "fit": "{:,.0f}", "from neighbors": "{:,.0f}", "grid": "{:,.0f}",
+                                                    "moved, median (px)": "{:.1f}", "90th (px)": "{:.1f}", "max (px)": "{:.1f}"})
+        for args in qc:
+            self._centering_qc(*args)
+
+    def _dumbbell_centers(self):
+        from .processing.grid import load_centers
+
+        if not getattr(self, "centered", None):
+            self.centered = {n: load_centers(self.masks / f"{n}_chamber_centers.csv") for n in ("reaction", "dna")}
+        return self.centered["reaction"], self.centered["dna"]
+
+    def quantify_expression(self):
+        """GFP on every scan of the time course, per chamber: in its DNA chamber, where it is expressed (the DNA chamber's
+        disc: dna_chamber_sum, _median, _n_px, and dna_chamber_sum_net = the sum minus the dumbbell's background ring's
+        median x its pixels), and over the whole dumbbell (its reaction chamber, DNA chamber and the neck between their
+        centered circles, minus a ring around the outline; hp.dumbbell_intensities). Writes
+        4_exports/expression/gfp_expression_per_dumbbell.csv. QC: the reaction chambers on the last scan, the controls'
+        DNA-chamber GFP over time. Returns the table."""
+        import matplotlib.pyplot as plt
+
+        from .analysis.plots import show_masks
+        from .processing.grid import load_mask
+        from .processing.quantify import centers_to_df, dumbbell_intensities
+
+        if not self.expression_keys:
+            return None
+        (dbx, dby), (dnx, dny) = self._dumbbell_centers()
+        rmask, dmask = load_mask(self.reaction_corners), load_mask(self.dna_corners)
+        shape = dict(dna_radius=dmask["radius"], neck_width=rmask["neck_width"])
+        parts = []
+        for k in self.expression_keys:
+            img = self.image(k)
+            d = dumbbell_intensities(img, dbx, dby, self.pinlist, radius=rmask["radius"], dumbbell=shape,
+                                     ring=(2.0, float(rmask["bg_outer"])), dna_x=dnx, dna_y=dny)
+            dna = centers_to_df(dnx, dny, self.pinlist, img=img, radius=dmask["radius"], aggs=("sum", "median"), prefix="dna_chamber")
+            for col in ("dna_chamber_sum", "dna_chamber_median", "dna_chamber_n_px"):
+                d[col] = dna[col].to_numpy()
+            # the background: the median of the ring around the whole dumbbell (clear of the neck and the reaction chamber)
+            d["dna_chamber_sum_net"] = d["dna_chamber_sum"] - d["dumbbell_bg"] * d["dna_chamber_n_px"]
+            parts.append(d.assign(scan=Path(k).name, minutes=self.expression[Path(k).name]))
+        expression = pd.concat(parts, ignore_index=True)
+        (self.exports / "expression").mkdir(parents=True, exist_ok=True)
+        expression.to_csv(self.exports / "expression/gfp_expression_per_dumbbell.csv", index=False)
+        self.save_fig(show_masks(self.image(self.expression_keys[-1]), dbx, dby, radius=rmask["radius"],
+                                 title="reaction chambers, last expression scan"), "2_expression", "2a_dumbbell_grid", show=False, dpi=150)
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        for tag, color in (("WT", "#C0392B"), ("N41A", "#1F4E79"), ("BLANK", "0.5")):
+            for _, g in expression[expression["tag"] == tag].groupby(KEYS):
+                ax.plot(g["minutes"], g["dna_chamber_sum_net"] / 1e6, "o-", ms=3, lw=0.8, color=color, alpha=0.8)
+            ax.plot([], [], color=color, label=tag)
+        ax.set(xlabel="minutes", ylabel="GFP in the DNA chamber, minus background (10$^6$ RFU)")
+        ax.legend(frameon=False)
+        note(f"**GFP in the DNA chambers** (where it is expressed) and over each dumbbell, {len(self.expression_keys)} time points · reaction chamber r {rmask['radius']:g} px, "
+             f"DNA chamber r {dmask['radius']:g} px (median {np.median(dnx - dbx):.0f}, {np.median(dny - dby):.0f} px away), "
+             f"neck {rmask['neck_width']:g} px, background ring to {rmask['bg_outer']:g} px · `4_exports/expression/gfp_expression_per_dumbbell.csv`")
+        ctrl = (expression[expression["tag"].isin(["WT", "N41A", "BLANK"])].groupby(["tag", "minutes"])["dna_chamber_sum_net"]
+                .median().unstack("minutes").reindex(["WT", "N41A", "BLANK"]) / 1e6)
+        ctrl.columns = [f"{m:g} min" for m in ctrl.columns]
+        table(ctrl, caption="controls, median GFP in the DNA chamber minus background (10⁶ RFU)", fmt="{:.2f}")
+        self.save_fig(fig, "2_expression", "2b_expression_time_course_controls")
+        self.expression_table = expression
+        return expression
+
+    # ------------------------------------------------------------------ 3. buttons
+    def find_buttons(self):
+        """Each button from its centered reaction chamber plus an offset (first the one that puts the most last-wash
+        signal under button-sized discs, searched ±120 px, then 1 px; then an affine map from the reaction chambers to the
+        buttons found, refit over three rounds, since the offset drifts over the chip; then each button from its grid place and
+        the misses of its 8 nearest found buttons); buttons with a GFP spot that stands out (above the
+        BLANKs' median + 3 SD of the spot's contrast) are centered on it with a disc the spot's size (`button_spot_r`,
+        within `button_reach`), the rest take their neighbors' shift. Writes 2_masks/button_centers.csv. QC: examples.
+        The centers are kept in `exp.buttons`."""
+        from scipy import ndimage
+
+        from .processing.grid import center_on_disc_sum, save_centers, shift_from_neighbors
+
+        if not self.button_scan:
+            return None
+        wash = self.image(self.button_scan)
+        (dbx, dby), _ = self._dumbbell_centers()
+        blur = ndimage.uniform_filter(np.nan_to_num(wash), 2 * self.button_r)
+        score = lambda dy, dx: ndimage.map_coordinates(blur, [dby.ravel() + dy, dbx.ravel() + dx], order=1).mean()
+        best = max((score(dy, dx), dy, dx) for dy in range(-120, 121, 6) for dx in range(-120, 121, 6))
+        best = max((score(dy, dx), dy, dx) for dy in range(best[1] - 6, best[1] + 7) for dx in range(best[2] - 6, best[2] + 7))
+        ox, oy = dbx + best[2], dby + best[1]
+        # the offset drifts over the chip (the scans' small rotation and scale): an affine map from the reaction chambers to
+        # the buttons found so far, refit a few rounds (fits off by more than 3 robust SDs left out of each)
+        affine_res = None
+        for _ in range(3):
+            # a disc the size of the GFP spot (a disc larger than the spot has a flat top and lands off-center)
+            sx, sy, ok = center_on_disc_sum(wash, ox, oy, self.button_spot_r, reach=self.button_reach)
+            bright = self._visible(wash, sx, sy, self.button_spot_r, self.button_spot_r + 4, self.button_spot_r + 16, self.tags)
+            ok &= bright
+            if ok.sum() < 20:
+                break
+            A = np.c_[dbx[ok], dby[ok], np.ones(ok.sum())]
+            keep = np.ones(ok.sum(), bool)
+            for _ in range(2):
+                cx_, *_ = np.linalg.lstsq(A[keep], sx[ok][keep], rcond=None)
+                cy_, *_ = np.linalg.lstsq(A[keep], sy[ok][keep], rcond=None)
+                res = np.hypot(A @ cx_ - sx[ok], A @ cy_ - sy[ok])
+                keep = res <= np.median(res) + 3 * 1.4826 * np.median(np.abs(res - np.median(res)))
+            full = np.stack([dbx, dby, np.ones_like(dbx)], -1)
+            ox, oy = full @ cx_, full @ cy_
+            affine_res = np.median(res[keep])
+        # every button predicted from its place on the grid (an affine map of row and column fit to the buttons found),
+        # plus the median miss of its 8 nearest found buttons: local distortion, without leaning on each reaction chamber's
+        # own center (left-one-out on MBO-056: 4.8 px median, 12 px 90th percentile)
+        sx, sy, ok = center_on_disc_sum(wash, ox, oy, self.button_spot_r, reach=self.button_reach)
+        ok &= self._visible(wash, sx, sy, self.button_spot_r, self.button_spot_r + 4, self.button_spot_r + 16, self.tags)
+        if ok.sum() >= 20:
+            rr, cc = np.indices(ox.shape).astype(float)
+            G = np.stack([rr, cc, np.ones_like(rr)], -1)
+            gx = G @ np.linalg.lstsq(G[ok], sx[ok], rcond=None)[0]
+            gy = G @ np.linalg.lstsq(G[ok], sy[ok], rcond=None)[0]
+            fr, fc = rr[ok], cc[ok]
+            mx, my = (sx - gx)[ok], (sy - gy)[ok]
+            d = np.hypot(rr.ravel()[:, None] - fr[None], cc.ravel()[:, None] - fc[None])
+            near = np.argsort(d, axis=1)[:, :8]
+            ox = gx + np.median(mx[near], axis=1).reshape(ox.shape)
+            oy = gy + np.median(my[near], axis=1).reshape(oy.shape)
+        sx, sy, ok = center_on_disc_sum(wash, ox, oy, self.button_spot_r, reach=self.button_reach)
+        bright = self._visible(wash, sx, sy, self.button_spot_r, self.button_spot_r + 4, self.button_spot_r + 16, self.tags)
+        ok &= bright
+        bx, by, fill = shift_from_neighbors(ox, oy, sx, sy, ok)
+        save_centers(self.masks / "button_centers.csv", bx, by, np.select([ok, fill], ["fit", "neighbors"], "offset"))
+        d = np.hypot(bx - ox, by - oy)
+        note(f"**Found the buttons** on `{Path(self.button_scan).name}` · {best[2]:+d}, {best[1]:+d} px (x, y) from the reaction "
+             f"chambers on average; each predicted from its grid place and its 8 nearest found buttons" +
+             f"; {bright.sum():,} with a GFP spot (contrast above the BLANK median + 3 SD)")
+        table(pd.DataFrame([{"centered on the spot": ok.sum(), "from neighbors": fill.sum(), "at the offset": (~ok & ~fill).sum(),
+                             "moved, median (px)": np.median(d), "max (px)": d.max()}], index=["buttons"]),
+              fmt={"centered on the spot": "{:,.0f}", "from neighbors": "{:,.0f}", "at the offset": "{:,.0f}",
+                   "moved, median (px)": "{:.1f}", "max (px)": "{:.1f}"})
+        self._centering_qc(wash, (ox, oy), (bx, by), self.button_r, ok, fill, "3_buttons/3a-masks", "3a_button_centering",
+                           f"buttons on {self.sds_washes[self.button_scan]}: dashed the reaction chamber + offset, solid the centered button",
+                           int(2.2 * self.button_r))
+        self.buttons = (bx, by)
+
+    def quantify_buttons(self):
+        """Every GFP scan (time course, background, washes): the button sum and median, the ring's median, and the button
+        sum minus the same button on the background scan. Writes 4_exports/gfp/gfp_per_chamber.csv. QC: the button ROIs
+        on the last wash, and the button mosaic (every button as a crop, laid out as the chip; one PDF page). Returns
+        the table."""
+        from .analysis.plots import button_mosaic, show_masks
+        from .processing.grid import load_centers
+        from .processing.quantify import centers_to_df
+
+        if not self.button_scan:
+            return None
+        bx, by = getattr(self, "buttons", None) or load_centers(self.masks / "button_centers.csv")
+        labels = {**{f"{self.expression_dir}/{n}": f"expression {m:g} min" for n, m in self.expression.items()},
+                  "/".join(self.gfp_background): "background", **self.sds_washes}
+        lo, hi = self.button_ring
+        gfp = pd.concat([centers_to_df(bx, by, self.pinlist, img=self.image(k), radius=self.button_r, aggs=("median", "sum"), bg=True,
+                                       bg_inner=lo, bg_outer=hi, prefix="button", name=lab).assign(scan=lab)
+                         for k, lab in labels.items()], ignore_index=True)
+        bg_sum = gfp[gfp["scan"] == "background"].set_index(KEYS)["button_sum"]
+        gfp["button_sum_minus_bg"] = gfp["button_sum"].to_numpy() - gfp.set_index(KEYS).index.map(bg_sum).to_numpy()
+        gfp = gfp[KEYS + ["tag", "scan"] + [c for c in gfp if c not in KEYS + ["tag", "scan"]]]
+        (self.exports / "gfp").mkdir(parents=True, exist_ok=True)
+        gfp.to_csv(self.exports / "gfp/gfp_per_chamber.csv", index=False)
+        cols = list(self.sds_washes.values())   # the background scan itself reads 0 by definition
+        ctrl = gfp.groupby(["tag", "scan"])["button_sum_minus_bg"].median().unstack("scan").reindex(["WT", "N41A", "BLANK"])[cols] / 1e3
+        note(f"**GFP per button**, {len(labels)} scans · button r {self.button_r:g} px, ring {lo:g}-{hi:g} px · "
+             "`4_exports/gfp/gfp_per_chamber.csv`; the mosaic: `5_figures/qc/3_buttons/3a-masks/3a_button_mosaic.pdf`")
+        table(ctrl, caption="controls, median button sum minus the background scan (10³ RFU)", fmt="{:,.0f}")
+        wash = self.image(self.button_scan)
+        label = self.sds_washes[self.button_scan]
+        self.save_fig(show_masks(wash, bx, by, radius=self.button_r, bg_inner=lo, bg_outer=hi, title=f"button ROIs, {label}"),
+                      "3_buttons/3a-masks", "3a_masks_buttons", show=False, dpi=150)
+        vals = gfp[gfp["scan"] == label].set_index(KEYS)["button_sum_minus_bg"].unstack().reindex(index=range(self.n_rows), columns=range(self.n_cols))
+        self.save_fig(button_mosaic(wash, bx, by, self.tags, vals.to_numpy(), half=int(1.9 * self.button_r), radius=self.button_r,
+                                    title=f"{self.experiment} GFP buttons, {label}", value_label="bg-subtracted button sum"),
+                      "3_buttons/3a-masks", "3a_button_mosaic", show=False, exts=("pdf",))
+        self.gfp_table = gfp
+        return gfp
+
+    # ------------------------------------------------------------------ 4. assay
+    def place_chambers(self, force=None):
+        """The assay's chamber grid (interactive) on the highest [S] run's last pass, seeded from the reaction chambers
+        (else `seed_corners`); then each ROI centered on its chamber's shape (`center_reach`). Writes
+        2_masks/assay_chamber_centers.csv. QC: the ROIs on the run's last pass. The centers are kept in `exp.chambers`."""
+        from .analysis.plots import show_masks
+        from .processing.grid import center_on_disc_sum, load_mask, save_centers, shift_from_neighbors, warped_grid
+        from .processing.grid_adjuster import GridAdjuster
+
+        if not self.reference_run:
+            return None
+        flag = self.open_chamber_window if force is None else force
+        if self.place(flag, self.chamber_corners):
+            self._interactive()
+            seed = None if self.chamber_corners.exists() else (load_mask(self.reaction_corners)["corners"] if self.reaction_corners.exists()
+                                                               else load_mask(self.seed_corners)["corners"] if self.seed_corners else None)
+            GridAdjuster(self.stores[self.reference_run]["image"], columns=self.pinlist, frame=-1, corners=seed, radius=self.chamber_r,
+                         bg_outer=self.chamber_ring[1] - self.chamber_r, corners_path=self.chamber_corners, warp_path=self.chamber_warp,
+                         vmax_pct=99.5)
+            self._inline()
+        gx, gy = warped_grid(self.chamber_corners, self.chamber_warp, self.n_rows, self.n_cols)
+        ref = self.image(self.reference_run)   # the last pass: the most product, the chambers' outlines clearest
+        sx, sy, ok = center_on_disc_sum(ref, gx, gy, self.chamber_r, reach=self.center_reach)
+        kx, ky, fill = shift_from_neighbors(gx, gy, sx, sy, ok)
+        save_centers(self.masks / "assay_chamber_centers.csv", kx, ky, np.select([ok, fill], ["fit", "neighbors"], "grid"))
+        note(f"**Chamber masks** on `{Path(self.reference_run).name}` · centered {ok.sum():,}, from neighbors {fill.sum():,}, "
+             f"grid {(~ok & ~fill).sum():,}")
+        self.save_fig(show_masks(self.image(self.reference_run), kx, ky, radius=self.chamber_r, bg_inner=self.chamber_ring[0],
+                                 bg_outer=self.chamber_ring[1], title=f"chamber ROIs, {self.reference_run}, last pass"),
+                      "5_assay/5a-chambers", "5a_chamber_masks", show=False, dpi=150)
+        self.chambers = (kx, ky)
+
+    def _chamber_centers(self):
+        from .processing.grid import load_centers
+
+        return getattr(self, "chambers", None) or load_centers(self.masks / "assay_chamber_centers.csv")
+
+    def quantify_assay(self, force=False):
+        """The chamber ROI median (RFU) at every pass of every run, each chamber timed by its own tile; every pass kept,
+        flagged `complete_pass` and `tile_imaged`. With the expression time course's dumbbells, also the DNA chamber's
+        median at every pass (`dna_chamber_median`; the neck is closed during an assay, so a rise means diffusion under
+        it, or activity in the DNA chamber). Each frame is read once for both masks. A run is quantified once and kept in
+        3_intermediate/assay/<run>.csv, reused while its masks, radii and stitched store are unchanged (`force=True`
+        re-reads every run). Writes 4_exports/assay/nadh_per_chamber.csv. QC: the control traces. Returns the table."""
+        import hashlib
+
+        from .analysis.plots import plot_control_traces
+        from .processing.grid import load_mask
+        from .processing.quantify import chamber_timecourse
+
+        if not self.reference_run:
+            return None
+        kx, ky = self._chamber_centers()
+        # each chamber's DNA chamber, at its own offset from the reaction chamber (from the expression centering)
+        dna = None
+        if (self.masks / "reaction_chamber_centers.csv").exists() and (self.masks / "dna_chamber_centers.csv").exists():
+            (rx, ry), (dx_, dy_) = self._dumbbell_centers()
+            dna = (np.asarray(kx) + (np.asarray(dx_) - np.asarray(rx)), np.asarray(ky) + (np.asarray(dy_) - np.asarray(ry)))
+            dna_r = load_mask(self.dna_corners)["radius"]
+        cache = self.intermediate / "assay"
+        cache.mkdir(parents=True, exist_ok=True)
+        masks_key = hashlib.sha1(np.round(np.stack([kx, ky, *(dna if dna is not None else ())]), 2).tobytes()
+                                 + repr((self.chamber_r, self.chamber_ring, dna_r if dna is not None else None)).encode()).hexdigest()
+        tables, reused = [], 0
+        for run, s_uM in self.assay_runs.items():
+            key = f"{self.assay_dir}/{run}"
+            if key not in self.stores:
+                self.stitch(key)
+            s = self.stores[key]
+            sec = s["tiled"]["seconds"].values.reshape(s["tiled"].sizes["time"], -1)
+            complete = (sec > 0).all(axis=1)
+            store_file = self.stitched / f"{key}.zarr" / "zarr.json"
+            run_key = masks_key + (f"{store_file.stat().st_mtime:.0f}" if store_file.exists() else "")
+            csv, keyfile = cache / f"{run}.csv", cache / f"{run}.key"
+            if not force and csv.exists() and keyfile.exists() and keyfile.read_text() == run_key:
+                t = pd.read_csv(csv)
+                reused += 1
+            else:
+                also = [dict(cx=dna[0], cy=dna[1], radius=dna_r, prefix="dna_chamber")] if dna is not None else ()
+                t = chamber_timecourse(s["image"], kx, ky, self.pinlist, s["tiled"], s["store"].attrs["tile_px"],
+                                       radius=self.chamber_r, ring=self.chamber_ring, aggs=("median",), prefix="chamber_ROI",
+                                       name=run, also=also)
+                t.to_csv(csv, index=False)
+                keyfile.write_text(run_key)
+            tables.append(t.assign(run=run, minutes=t["seconds"] / 60, tile_imaged=t["seconds"] > 0,
+                                   complete_pass=complete[t["frame"].to_numpy()], **{self.substrate: s_uM}))
+            self._passes = getattr(self, "_passes", {}) | {f"{s_uM:g} µM": (int(complete.sum()), len(complete))}
+        nadh = pd.concat(tables, ignore_index=True)
+        (self.exports / "assay").mkdir(parents=True, exist_ok=True)
+        nadh.to_csv(self.exports / "assay/nadh_per_chamber.csv", index=False)
+        note(f"**NADH per chamber**, {len(self.assay_runs)} runs ({len(self.assay_runs) - reused} read, {reused} unchanged since "
+             "last time) · `4_exports/assay/nadh_per_chamber.csv`")
+        table(pd.DataFrame(self._passes, index=["complete passes", "passes"]).T, fmt="{:,.0f}")
+        self.save_fig(plot_control_traces(nadh, "chamber_ROI_median", s=self.substrate), "5_assay/5b-nadh", "5b_control_traces")
+        return nadh
+
+    # ------------------------------------------------------------------ 5. standards
+    def quantify_standards(self):
+        """Each camera's NADH standards read with the assay's chamber masks and ROI, no flatfield (the calibration is fit
+        in the analysis notebook). Writes 4_exports/assay/standards/<camera>/nadh_standards_per_chamber.csv. Returns
+        {camera: table}."""
+        from .processing.quantify import centers_to_df
+
+        if not self.standards:
+            return None
+        kx, ky = self._chamber_centers()
+        out = {}
+        for cam, runs in self.standards.items():
+            folder = self.exports / "assay/standards" / cam
+            folder.mkdir(parents=True, exist_ok=True)
+            std = pd.concat([centers_to_df(kx, ky, self.pinlist, img=self.image(f"Standards/{cam}/{n}"), radius=self.chamber_r,
+                                           aggs=("median",), bg=True, bg_inner=self.chamber_ring[0], bg_outer=self.chamber_ring[1],
+                                           prefix="chamber_ROI", name=n).assign(camera=cam, nadh_uM=conc, standard=n)
+                             for n, conc in runs.items()], ignore_index=True)
+            std.to_csv(folder / "nadh_standards_per_chamber.csv", index=False)
+            out[cam] = std
+        med = pd.DataFrame({cam: t.groupby("nadh_uM")["chamber_ROI_median"].median() for cam, t in out.items()})
+        med.index = [f"{v:g} µM" for v in med.index]
+        note(f"**NADH standards**, {', '.join(out)} · `4_exports/assay/standards/<camera>/nadh_standards_per_chamber.csv`")
+        table(med, caption="median chamber ROI (RFU)", fmt="{:,.0f}")
+        return out

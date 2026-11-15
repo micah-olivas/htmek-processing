@@ -61,6 +61,8 @@ from .processing.stitch import (  # noqa: F401
 )
 from .processing.protocol_log import read_protocol_log, protocol_summary  # noqa: F401
 from .processing.provenance import record_raw_source, write_raw_readme  # noqa: F401
+from .experiment import Experiment  # noqa: F401
+from .analysis_steps import Analysis, robust_floor  # noqa: F401
 from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure  # noqa: F401
 from .analysis.expression import expression_calls, blank_leakage, dna_chamber_diffusion, diffusion_figure  # noqa: F401
 from .report.expression import expression_report  # noqa: F401
@@ -242,9 +244,12 @@ __all__ = [
     "fit_flatfield",
     "stitch_run",
     "record_raw_source",
+    "Experiment",
     "expression_calls",
     "blank_leakage",
     "dna_chamber_diffusion",
+    "Analysis",
+    "robust_floor",
     "tile_medians",
     "tile_deviations",
     "tile_of",
