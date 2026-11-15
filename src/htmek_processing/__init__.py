@@ -61,6 +61,7 @@ from .processing.stitch import (  # noqa: F401
 )
 from .processing.protocol_log import read_protocol_log, protocol_summary  # noqa: F401
 from .processing.provenance import record_raw_source, write_raw_readme  # noqa: F401
+from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure  # noqa: F401
 from .processing.grid import (  # noqa: F401
     grid_centers,
     bilinear_grid,
@@ -239,6 +240,10 @@ __all__ = [
     "fit_flatfield",
     "stitch_run",
     "record_raw_source",
+    "tile_medians",
+    "tile_deviations",
+    "tile_of",
+    "tile_figure",
     "write_raw_readme",
     "tile_seam_flags",
     "chamber_seconds",
