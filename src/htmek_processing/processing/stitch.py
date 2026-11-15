@@ -373,7 +373,9 @@ def stitch_to_zarr(
         from concurrent.futures import ProcessPoolExecutor
         import multiprocessing as mp
 
-        with ProcessPoolExecutor(n_jobs, mp_context=mp.get_context("spawn")) as ex:
+        from ..workers import headless_workers
+
+        with headless_workers(), ProcessPoolExecutor(n_jobs, mp_context=mp.get_context("spawn")) as ex:
             list(ex.map(_stitch_frame, [dict(job, idx=idx) for idx in frames]))
     else:
         for idx in frames:

@@ -104,8 +104,8 @@ def record_raw_source(src, stitched, tiled, record_dir="1_raw-images"):
 def write_raw_readme(table, path):
     """`README.md` for `1_raw-images/`: where the raw acquisitions are, one table per group."""
     lines = ["# Raw images", "",
-             "The raw acquisitions are not stored in this folder. They stay on the external drive, at the paths below;",
-             "`raw_sources.csv` holds the same record as a table. Written by `htmek_processing` (`record_raw_source`,",
+             "The raw acquisitions are stored on a separate drive, at the paths below;",
+             "The same record is provided as a table in `raw_sources.csv`. This record is written by `htmek_processing` (`record_raw_source`,",
              "called from `stitch_run`) each time an acquisition is stitched.", ""]
     roots = sorted({str(Path(p).parent) for p in table["raw_path"]})
     if roots:

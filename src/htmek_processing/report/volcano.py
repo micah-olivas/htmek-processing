@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 KEYS = ["mark_row", "mark_col"]
-SCANS = {"A": "Ala scan", "F": "Phe scan", "M": "Met scan"}  # mutant residue -> panel
+SCANS = {"A": "Ala scan", "F": "Phe scan", "M": "Met scan", "*": "TAG scan"}  # mutant residue -> panel ("*": a TAG codon)
 BOOT_STEPS = ((100, 0.1), (1_000, 0.01), (100_000, None))  # (iterations, go on if p <= this)
 COLORS = {"significant": "#E8833A", "not significant": "0.72", "edge": "0.15"}
 SIZE_PER_REPLICATE = 14  # volcano marker area (pt²) per chamber
@@ -200,7 +200,8 @@ def bootstrap_p_fixed(v, ref, rng, *, steps=BOOT_STEPS, chunk=10_000):
 
 def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), min_replicates=2,
                   min_ref_chambers=3, p_significant=0.01, require_expressed=True, scans=SCANS,
-                  steps=BOOT_STEPS, seed=0, fixed_reference=None, reference_lines=None):
+                  steps=BOOT_STEPS, seed=0, fixed_reference=None, reference_lines=None,
+                  ref_require_expressed=None):
     """One row per variant (not in `exclude`): replicates, fold change vs the reference,
     bootstrap p and 95 % interval. Returns (table, ref: the reference's log2 values,
     s_range).
@@ -209,11 +210,17 @@ def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), mi
     that quantity against one value (in its unit, e.g. Km in µM) instead of reference
     chambers, e.g. {"km": dict(value=704, name="MBO-040 WT", placeholder=True)}.
     `reference_lines`, in the same form, only marks such a value on the plot (a dashed
-    line at its fold change from the reference), leaving the test as it is."""
+    line at its fold change from the reference), leaving the test as it is.
+    `ref_require_expressed` (default: as `require_expressed`) False lets every reference chamber
+    with a passing fit count, its GFP above the floor or not (e.g. a chip where few WT buttons
+    clear it); the variants still need it."""
     s_range = (rates["bzp_uM"].min(), rates["bzp_uM"].max())
     ok = chamber_values(q, fits, rates, s_range, require_expressed=require_expressed)
     sd, _ = pooled_replicate_sd(ok["log2_value"], ok["tag"])
     ref = ok.loc[ok["tag"] == reference, "log2_value"].to_numpy()
+    if ref_require_expressed is not None and ref_require_expressed != require_expressed:
+        r_ok = chamber_values(q, fits, rates, s_range, require_expressed=ref_require_expressed)
+        ref = r_ok.loc[r_ok["tag"] == reference, "log2_value"].to_numpy()
     ref_label = reference
     library = ok[~ok["tag"].isin(exclude)]
     fixed = (fixed_reference or {}).get(q.name)

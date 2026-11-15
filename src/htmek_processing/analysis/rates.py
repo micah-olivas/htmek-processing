@@ -434,6 +434,7 @@ def fit_4pl_rates(
     `if __name__ == "__main__":`, since each worker process re-imports the script."""
     import os
     from concurrent.futures import ProcessPoolExecutor
+    from ..workers import headless_workers
 
     if end is not None:
         df = df[df[t] <= end]
@@ -459,7 +460,7 @@ def fit_4pl_rates(
     if n_jobs == 1 or len(jobs) < 200:
         fits = [_fit_4pl_summary(j) for j in jobs]
     else:
-        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        with headless_workers(), ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
             fits = list(pool.map(_fit_4pl_summary, jobs, chunksize=32))
 
     # fixed column order; columns a chamber's fit didn't produce are NaN

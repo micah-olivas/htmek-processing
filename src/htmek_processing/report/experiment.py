@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm, TwoSlopeNorm
 
+from ..processing.layout import display_tag
 from . import volcano as V
 from .chamber import REPORT_COLORS, _PAGE, _REPORT_STYLE, _grid_table, _log_minor_ticks
 
@@ -38,7 +39,14 @@ KEYS = V.KEYS
 GRID = _PAGE  # 11 in wide; 6 columns of col_w, gap apart, from `left`
 PAGE = (11, 8.5)  # inches, landscape
 CONTROLS = {"WT": "o", "N41A": "s", "BLANK": "^"}  # control -> marker on the chip maps
-SCAN_COLORS = {"Ala scan": "#4E79A7", "Phe scan": "#E1812C", "Met scan": "#59A14F"}
+SCAN_COLORS = {"Ala scan": "#4E79A7", "Phe scan": "#E1812C", "Met scan": "#59A14F", "TAG scan": "#8E44AD"}
+
+
+def scan_label(scan):
+    """A scan's name in a legend: a TAG scan by the amino acid it incorporates (set_tag_suffix), e.g. "AHA (TAG)"."""
+    from ..processing import layout
+
+    return f"{layout.TAG_SUFFIX} (TAG)" if scan == "TAG scan" and layout.TAG_SUFFIX != "tag" else scan
 STATUS = {  # MM fit status on the chip map: (color, label)
     "pass": ("#1F4E79", "pass: r² ≥ {min_r2:g}"),
     "fail": ("#E8A3A0", "fail: r² < {min_r2:g}"),
@@ -397,10 +405,12 @@ def page_distributions(pdf, chambers, ctx):
             edges = np.logspace(np.log(v.min()) / np.log(base), np.log(v.max()) / np.log(base) + 1e-9,
                                 41, base=base)
             ax.hist(v, bins=edges, color="#4E79A7", edgecolor="0.3", lw=0.3)
-        ax.set_xscale("log", base=base)
-        _log_minor_ticks(ax.xaxis)
-        if col == "km":
-            km_ticks(ax.xaxis, ctx.s_ticks)
+            ax.set_xscale("log", base=base)
+            _log_minor_ticks(ax.xaxis)
+            if col == "km":
+                km_ticks(ax.xaxis, ctx.s_ticks)
+        else:
+            ax.text(0.5, 0.5, "no analyzed chambers", ha="center", va="center", transform=ax.transAxes, color="0.4")
         for w in chambers.loc[analyzed & (chambers["tag"] == "WT"), col].dropna():
             ax.axvline(w, color="#C0392B", lw=1.2)
         ax.set(xlabel=name + (" (log$_2$ scale)" if base == 2 else ""), ylabel="analyzed chambers")
@@ -420,20 +430,26 @@ def page_distributions(pdf, chambers, ctx):
 
     for scan, color in SCAN_COLORS.items():
         e = d[d["scan"] == scan]
+        if e.empty:   # only the scans this chip has
+            continue
         bars(e, color, 1)
-        ax.scatter(e["km"], e["vmax"], s=8, color=color, alpha=0.8, lw=0, label=scan, zorder=2)
+        ax.scatter(e["km"], e["vmax"], s=8, color=color, alpha=0.8, lw=0, label=scan_label(scan), zorder=2)
     wt = chambers[analyzed & (chambers["tag"] == "WT")]
     if len(wt):
         bars(wt, "#C0392B", 3)
         ax.scatter(wt["km"], wt["vmax"], s=40, color="#C0392B", ec="k", lw=0.5, label="WT", zorder=4)
     ax.set_title("error bars: ± 1 SE of each chamber's fit (omitted where the value is a bound)",
                  loc="left", fontsize=8, color="0.35")
-    ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    km_ticks(ax.xaxis, ctx.s_ticks)
-    _log_minor_ticks(ax.yaxis)
+    shown = pd.concat([d, wt])
+    if ((shown["km"] > 0) & (shown["vmax"] > 0)).any():   # log axes need a positive point
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        km_ticks(ax.xaxis, ctx.s_ticks)
+        _log_minor_ticks(ax.yaxis)
+        ax.legend(frameon=False, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "no analyzed chambers", ha="center", va="center", transform=ax.transAxes, color="0.4")
     ax.set(xlabel=f"{ctx.km_label} (µM, log$_2$ scale)", ylabel=f"{ctx.vmax_label} ({ctx.vmax_unit})")
-    ax.legend(frameon=False, fontsize=8)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -442,13 +458,14 @@ def volcano_size(n_chambers):
     return 4 * n_chambers + 6
 
 
-def volcano_key(ax, ctx, sizes):
-    """The volcano markers' key in the upper right of `ax`, and marker size per chambers."""
+def volcano_key(ax, ctx, sizes, scans=None):
+    """The volcano markers' key in the upper right of `ax`, and marker size per chambers; `scans`: the ones shown
+    (default all)."""
     def dot(label, **kw):
         style = dict(ls="", marker="o", ms=5, mfc="0.75", mec="0.25", mew=OUTLINE[False])
         return plt.Line2D([], [], label=label, **{**style, **kw})
 
-    main = ax.legend(handles=[dot(sc, mfc=c) for sc, c in SCAN_COLORS.items()]
+    main = ax.legend(handles=[dot(scan_label(sc), mfc=c) for sc, c in SCAN_COLORS.items() if scans is None or sc in scans]
                      + [dot(f"p < {ctx.p_significant:g}", mfc="white", mec="k", mew=OUTLINE[True]),
                         dot(f"{ctx.km_label} outside [S] range", marker=">"),
                         dot(f"{ctx.vmax_label}: lower bound", marker="<")],
@@ -499,7 +516,7 @@ def mini_volcano(ax, q, table, ctx):
         ((r, 0), (-r, 0), (r, r * 0.6), (-r, r * 0.6), (r, -r * 0.6), (-r, -r * 0.6))]
     for row in named.itertuples():
         for dx, dy in spots:
-            label = ax.annotate(row.tag, (row.log2_fc, row.neg_log10_p), xytext=(dx, dy),
+            label = ax.annotate(display_tag(row.tag), (row.log2_fc, row.neg_log10_p), xytext=(dx, dy),
                                 textcoords="offset points", fontsize=8, va="center",
                                 ha="left" if dx > 0 else "right", color="0.15" if row.significant else "0.5",
                                 arrowprops=dict(arrowstyle="-", color="0.55", lw=0.5, shrinkA=1, shrinkB=3))
@@ -645,7 +662,8 @@ def page_summary(pdf, chambers, tables, qs, ctx):
             ax.set_title(f"{q.label} volcano: −log$_{{10}}$ p", loc="left", fontsize=11)
             if q.name == "vmax":
                 n = tables[q.name].loc[tables[q.name]["tested"], "n_chambers"]
-                volcano_key(ax, ctx, sorted({int(n.min()), int(round(n.median())), int(n.max())}))
+                volcano_key(ax, ctx, sorted({int(n.min()), int(round(n.median())), int(n.max())}),
+                            scans=set(tables[q.name]["scan"]) if "scan" in tables[q.name] else None)
         pdf.savefig(fig)
         plt.close(fig)
 

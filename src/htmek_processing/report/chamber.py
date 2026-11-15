@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from ..analysis.plots import FIT_COLORS
 from ..analysis.rates import four_pl
 from ..analysis.mm import michaelis_menten
+from ..processing.layout import display_tag
 
 
 # Version of the chamber report's layout and content. Bump it whenever the report changes
@@ -378,7 +379,7 @@ def _report_page(page, value, norm_col):
               chambers and this chamber marked (if raw MM fits were given)."""
     P = _PAGE
     runs, fits = page["runs"], page["fits"]
-    r, c, tag = page["row"], page["col"], page["tag"]
+    r, c, tag = page["row"], page["col"], display_tag(page["tag"])   # figures: "A4tag", not the pinlist's "A4*"
     enzyme = norm_col.split("_per_")[-1]
     rate_unit = page.get("rate_unit", "µM/s")
     col = [P["left"] + k * (P["col_w"] + P["gap"]) for k in range(6)]  # left edges
@@ -1770,6 +1771,7 @@ def chamber_report_pdf(
     import subprocess
     import tempfile
     from concurrent.futures import ProcessPoolExecutor
+    from ..workers import headless_workers
 
     # one contrast per image, from its chambers' area, so every page is comparable
     limits = {}
@@ -2083,7 +2085,7 @@ def chamber_report_pdf(
                  lead if k == 0 else None)  # the flowchart first
                 for k in range(n_jobs)
             ]
-            with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            with headless_workers(), ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
                 list(pool.map(_report_chunk, jobs))
             subprocess.run(["pdfunite", *map(str, parts), str(partial)], check=True)
     partial.replace(path)
