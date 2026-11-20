@@ -4,8 +4,9 @@
     an = hp.Analysis.from_config(globals())
     an.call_expression()
     an.call_buttons()
+    an.call_labeling()
     an.check_diffusion()
-    an.calibrate()
+    an.fit_standards()
     an.fit_rates()
     an.rates_vs_enzyme()
     an.fit_mm()
@@ -17,6 +18,8 @@ shows a short summary, saves its QC figures under 5_figures/qc and its tables un
 the Analysis (e.g. `an.rates`)."""
 from __future__ import annotations
 
+import copy
+import functools
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +37,9 @@ CONFIG_NAMES = {
     "N_SD": "n_sd", "FLOOR": "floor", "BUTTON_SCAN": "button_scan", "BUTTON_VALUE": "button_value",
     "STANDARDS_CAMERA": "standards_camera", "CONC_MAX": "conc_max", "RATE_RULES": "rate_rules",
     "MIN_R2": "min_r2", "DROP_FLAGGED_TILES": "drop_flagged_tiles", "MIN_BLEACH_BLANKS": "min_bleach_blanks", "TAG_SUFFIX": "tag_suffix", "MIN_REF_CHAMBERS": "min_ref_chambers", "REF_NEEDS_GFP_FLOOR": "ref_needs_gfp_floor",
+    "DEPLETED_EARLY": "depleted_early", "STANDARDS_MODEL": "standards_model", "PBP_MAX_FRAC": "pbp_max_frac",
+    "CALIBRATION": "standards_model",   # the name before 2026-11-20
+    "BUTTON_SCAN_NOTE": "button_scan_note", "VOLCANO_REFERENCE": "volcano_reference", "VOLCANO_REFERENCE_NOTE": "volcano_reference_note",
 }
 
 
@@ -94,6 +100,35 @@ def calls_figure(df, value, floor, called, *, xlabel, floor_label, n_rows=56, n_
     return fig
 
 
+# results every assay series shares: the expression and button calls (a series view copies them before each step)
+SHARED = ("enzyme", "gfp_floor", "enzyme_scan", "blank_chambers", "expression_chambers", "expression_variants",
+          "expression_floor", "labeling")
+# a series' own results: reset in its view
+PER_SERIES = ("rates", "mm", "mm_raw", "traces", "norm", "diffusion", "standards_fit", "rate_unit")
+
+
+def each_series(step):
+    """An assay step that runs once per assay series (Analysis.series_views): ASSAY_RUNS' table and each of 1-Process's
+    SERIES, under its own heading, each writing its own files. With one series it runs as is. Returns the step's result,
+    or {series name (None: ASSAY_RUNS): result} with more than one."""
+    @functools.wraps(step)
+    def run(self, *args, **kw):
+        if self.series_name is not None:   # a series' view: the step itself
+            return step(self, *args, **kw)
+        views = self.series_views()
+        if not views or views == [(None, self)]:
+            return step(self, *args, **kw)
+        out = {}
+        for name, view in views:
+            if view is not self:
+                for k in SHARED:
+                    setattr(view, k, getattr(self, k, None))
+            note(f"**▸ {view.series_title}**")
+            out[name] = step(view, *args, **kw)
+        return out
+    return run
+
+
 @dataclass
 class Analysis:
     """The analysis notebook's state: settings from its Configure cell, the process notebook's tables, and each
@@ -107,15 +142,22 @@ class Analysis:
     floor: str = "mad"                 # "mad": BLANK median + n_sd robust SDs; "sd": + n_sd SDs
     button_scan: str | None = None     # the button GFP scan (a `scan` label); None: the last SDS wash
     button_value: str = "button_sum_net"   # the button GFP readout: sum minus the ring inside the button rim
+    button_scan_note: str = ""             # why that scan: printed on the experiment report's summary page
+    volcano_reference: str = "WT"          # the volcanoes' reference: "WT", or "library" (the library median, e.g. WT dead on the chip)
+    volcano_reference_note: str = ""       # why, when it isn't WT: printed on the summary page
     standards_camera: str | None = None    # the standards' camera folder; None: the only one
-    conc_max: float | None = None          # calibrate on standards up to this [NADH] (µM)
+    conc_max: float | None = None          # fit the standards up to this [NADH] (µM)
+    standards_model: str = "line"          # the standards' fit: "line", a line per chamber (NADH); "pbp", a tight-binding sensor (phosphate binding protein, Pi)
+    pbp_max_frac: float = 0.9              # "pbp": passes whose bound sensor is above this fraction of it (near the plateau) get no [Pi]
     rate_rules: dict = field(default_factory=dict)   # overrides of hp.PROGRESS_4PL_RULES
     min_r2: float = 0.9                    # MM fits below this r² are left out of the report
     min_bleach_blanks: int = 5             # a run's bleaching model needs this many flat BLANKs; fewer: no correction
     ref_needs_gfp_floor: bool = True       # False: every WT chamber with a passing fit is the volcanoes' reference, its GFP above the floor or not
     min_ref_chambers: int = 3              # the volcanoes test against WT with at least this many WT chambers, else the library median
     tag_suffix: str | None = None          # how figures write a TAG ("*") substitution: None "A4tag"; e.g. "AHA": "A4AHA"
+    depleted_early: str | None = None      # "force": runs already slowing at the first image (hp.flag_early_depletion) take the 4PL's slope inside the run (hp.force_4pl_on_depleted); None: they keep the line
     drop_flagged_tiles: bool = True        # leave out buttons and chamber passes in a tile the process notebook flagged
+    series_name: str | None = None         # which assay series this is (a view, Analysis.series_views); None: ASSAY_RUNS'
 
     @classmethod
     def from_config(cls, namespace, **overrides):
@@ -142,20 +184,71 @@ class Analysis:
         self.expression = read("expression/gfp_expression_per_dumbbell.csv")
         self.gfp = read("gfp/gfp_per_chamber.csv")
         self.nadh = read("assay/nadh_per_chamber.csv")
+        # every assay series' table and [S] column (1-Process quantify_assay); "": ASSAY_RUNS'
+        idx = self.exports / "assay/series.json"
+        import json
+
+        self.series_index = json.loads(idx.read_text()) if idx.exists() else {}
+        self._views = None
         std = sorted((self.exports / "assay/standards").glob("*/nadh_standards_per_chamber.csv"))
         if self.standards_camera:
             std = [p for p in std if p.parent.name == self.standards_camera]
         self.standards = pd.read_csv(std[0]) if std else None
         self.tiles = read("qc/tile_medians.csv")   # 1-Process check_tiles: every tile's deviation, per scan and pass
-        self.value = "chamber_ROI_median"   # the progress-curve signal; calibrate() switches it to nadh_uM
+        self.value = "chamber_ROI_median"   # the progress-curve signal; fit_standards() switches it to nadh_uM
         self.enzyme = self.rates = self.mm = self.mm_raw = None
         rows = {"expression time course": self.expression, "button GFP": self.gfp, "assay": self.nadh, "NADH standards": self.standards}
         have = [f"{k} ({len(v):,} rows)" for k, v in rows.items() if v is not None]
         runs = f"; [S] runs: {', '.join(f'{s:g}' for s in sorted(self.nadh[self.substrate].unique()))} µM" if self.nadh is not None else ""
+        extra = {k: v for k, v in self.series_index.items() if k}
+        if extra:
+            runs += "; more assay series: " + ", ".join(f"{k} ({v['runs']} runs, `{v['substrate']}`)" for k, v in extra.items())
         note(f"**{self.experiment}** · from `4_exports`: {', '.join(have) or 'nothing yet'}{runs}")
 
     def __repr__(self):
-        return f"Analysis({self.experiment})"
+        return f"Analysis({self.experiment}" + (f", series {self.series_name})" if self.series_name else ")")
+
+    # ------------------------------------------------------------------ assay series
+    def series_views(self):
+        """[(name, Analysis)]: one per assay series the assay steps run on. ASSAY_RUNS' table is this Analysis (name
+        None; left out without a table), each 1-Process SERIES a view: a copy with that series' table, [S] column
+        (`substrate`) and its own results (`an.series("pnpp").rates`), sharing the expression and button calls."""
+        if self._views is None:
+            self._views = {}
+            for name, ent in self.series_index.items():
+                path = self.exports / "assay" / ent["file"]
+                if not name or not path.exists():
+                    continue
+                v = copy.copy(self)
+                v.series_name, v.substrate, v.nadh, v.value, v._views = name, ent["substrate"], pd.read_csv(path), "chamber_ROI_median", {}
+                for k in PER_SERIES:
+                    setattr(v, k, None)
+                self._views[name] = v
+        return ([(None, self)] if self.nadh is not None else []) + list(self._views.items())
+
+    def series(self, name):
+        """One assay series' view (its results: `an.series("pnpp").rates`); None: ASSAY_RUNS' (this Analysis)."""
+        views = dict(self.series_views())
+        if name not in views:
+            raise KeyError(f"No assay series {name!r}; there are: {', '.join(str(k) for k in views) or 'none'}")
+        return views[name]
+
+    @property
+    def series_title(self):
+        return f"Series {self.series_name} (`{self.substrate}`)" if self.series_name else f"Assay runs (`{self.substrate}`)"
+
+    @property
+    def _sfx(self):
+        """The series' file-name suffix: "" for ASSAY_RUNS', "_<name>" for a series."""
+        return f"_{self.series_name}" if self.series_name else ""
+
+    @property
+    def _report_title(self):
+        return f"{self.experiment} · {self.series_name}" if self.series_name else self.experiment
+
+    def _run_label(self, s_uM):
+        """A run's scan label in 1-Process's tables (the tile check), from its [S]."""
+        return f"{self.series_name or 'assay'} {s_uM:g} µM"
 
     def save_fig(self, fig, folder, name, show=True, **kw):
         """Save a QC figure in 5_figures/qc/<folder>/<name> (PDF and PNG), show it inline, close it."""
@@ -263,6 +356,8 @@ class Analysis:
         note(f"**Enzyme on the buttons** · `{self.button_value}` on {scan} · floor {floor:,.0f} RFU ({self._floor_label}"
              + (f"; {len(contaminated)} contaminated BLANKs left out" if contaminated else "") + ") · "
              f"{int(e['expressing'].sum()):,} of {int((e['tag'] != 'BLANK').sum()):,} buttons above it")
+        if self.button_scan_note:
+            note(f"Why {scan}: {self.button_scan_note}")
         if self.tiles is None:
             note("No tile check (`4_exports/qc/tile_medians.csv`; 1-Process `check_tiles`): buttons in a bad tile are not flagged")
         elif n_bad:
@@ -278,7 +373,31 @@ class Analysis:
                                    floor_label=self._floor_label, n_rows=self.n_rows, n_cols=self.n_cols),
                       "3_buttons/3b-calls", "3b_expressing_buttons")
 
+    # ------------------------------------------------------------------ 1b'. labeling
+    def call_labeling(self, gfp_scan=None):
+        """Cy5 labeling against the enzyme on each button (hp.labeling_table / labeling_figure): the post-labeling Cy5
+        button sum (minus the Cy5 background scan) against the button GFP on `gfp_scan` (default the button scan of
+        call_buttons, else the last SDS wash; minus the GFP background scan),
+        and their ratio. Needs 4_exports/gfp/cy5_per_chamber.csv. Writes 4_exports/gfp/labeling_per_chamber.csv; QC
+        3_buttons/3d-labeling/3d_cy5_vs_gfp."""
+        from .analysis.labeling import labeling_figure, labeling_table
+
+        path = self.exports / "gfp/cy5_per_chamber.csv"
+        if not path.exists() or self.gfp is None:
+            return note("No Cy5 per button (`4_exports/gfp/cy5_per_chamber.csv`) or no button GFP: skipped")
+        scans = list(dict.fromkeys(self.gfp["scan"]))
+        scan = gfp_scan or getattr(self, "enzyme_scan", None) or next((s for s in reversed(scans) if s.startswith("SDS wash")), scans[-1])
+        t = labeling_table(pd.read_csv(path), self.gfp, gfp_scan=scan, n_cols=self.n_cols)
+        t.to_csv(self.exports / "gfp/labeling_per_chamber.csv", index=False)
+        self.labeling = t
+        lib = t[~t["tag"].isin(CONTROLS) & t["gfp_above_floor"] & (t["cy5"] > 0)]
+        note(f"**Labeling** · Cy5 vs GFP ({scan}) · Cy5 / GFP of library buttons above the GFP floor: median "
+             f"{lib['cy5_over_gfp'].median():.3g} (left {lib.loc[lib['half'] == 'left', 'cy5_over_gfp'].median():.3g}, "
+             f"right {lib.loc[lib['half'] == 'right', 'cy5_over_gfp'].median():.3g}); {int(t['cy5_above_floor'].sum()):,} buttons above the Cy5 floor")
+        self.save_fig(labeling_figure(t, title=self.experiment, n_cols=self.n_cols), "3_buttons/3d-labeling", "3d_cy5_vs_gfp")
+
     # ------------------------------------------------------------------ 1c. diffusion
+    @each_series
     def check_diffusion(self):
         """Signal in the DNA chambers during the assay: the neck is closed, so a DNA chamber rises only when product
         diffuses under it (hp.dna_chamber_diffusion: each DNA chamber's slope against the BLANKs' floor, and its ratio to
@@ -289,7 +408,7 @@ class Analysis:
         if self.nadh is None or "dna_chamber_median" not in self.nadh:
             return note("No DNA-chamber readout in the assay table: skipped (1-Process: `quantify_assay` with the dumbbells placed)")
         t, s = dna_chamber_diffusion(self.nadh, time="minutes", per=(self.substrate,), n_sd=self.n_sd)
-        t.to_csv(self.exports / "assay/dna_chamber_diffusion.csv", index=False)
+        t.to_csv(self.exports / f"assay/dna_chamber_diffusion{self._sfx}.csv", index=False)
         self.diffusion = t
         note(f"**Signal in the DNA chambers during the assay** · {int(t['rising'].sum())} of {len(t):,} chamber-runs rising "
              f"(DNA-chamber slope above the {self._floor_label}). A rise is product diffusing under the neck, or activity "
@@ -305,29 +424,83 @@ class Analysis:
                                 "% of reaction slope": 100 * top["ratio"]}).set_index("chamber"),
                   caption="the rising chambers, highest ratio first", fmt={"[S] (µM)": "{:g}", "DNA slope (RFU/min)": "{:.2f}", "% of reaction slope": "{:.1f}"})
         self.save_fig(diffusion_figure(t, s, runs=list(s[self.substrate]), per=self.substrate, n_rows=self.n_rows, n_cols=self.n_cols),
-                      "5_assay/5c-diffusion", "5c_dna_chamber_diffusion")
+                      "5_assay/5c-diffusion", f"5c_dna_chamber_diffusion{self._sfx}")
 
-    # ------------------------------------------------------------------ 2. calibration
-    def calibrate(self):
-        """Per-chamber NADH standard curves (a line of the chamber ROI median vs [NADH], up to `conc_max`), then every
-        pass converted to µM (`nadh_uM`); the rates are then fit in µM with the [S] rules on. Writes
-        4_exports/assay/nadh_calibration_per_chamber.csv."""
-        from .analysis.standards import calibrate_chambers, predict_conc
+    # ------------------------------------------------------------------ 2. standards
+    @each_series
+    def fit_standards(self):
+        """Per-chamber standard curves, then every pass converted to µM (`nadh_uM`, the product's concentration); the
+        rates are then fit in µM with the [S] rules on. `standards_model` "line": a line of the chamber ROI median vs
+        [NADH] per chamber, up to `conc_max`. "pbp": the phosphate binding protein's tight-binding isotherm
+        (analysis.standards.fit_pbp_standards: the sensor's active concentration and Kd chip-wide, each chamber's intercept
+        and amplitude), inverted to [Pi]; passes near the sensor's plateau (`pbp_max_frac`) get NaN. Writes
+        4_exports/assay/standards_fit_per_chamber.csv. QC 4_standards: the curves of example chambers."""
+        from .analysis.standards import fit_pbp_standards, fit_standard_lines, predict_conc, predict_conc_pbp
 
         if self.standards is None:
-            return note("No NADH standards (`4_exports/assay/standards/<camera>/`): skipped; the rates are fit in RFU")
+            return note("No standards (`4_exports/assay/standards/<camera>/`): skipped; the rates are fit in RFU")
         if self.nadh is None:
             return note("No assay table: skipped")
-        cal = calibrate_chambers(self.standards, "chamber_ROI_median", x="nadh_uM", keep=("tag",), conc_max=self.conc_max)
-        cal.to_csv(self.exports / "assay/nadh_calibration_per_chamber.csv", index=False)
-        self.calibration = cal
+        if self.standards_model == "pbp":
+            cal = fit_pbp_standards(self.standards, "chamber_ROI_median", x="nadh_uM", keep=("tag",))
+            cal.to_csv(self.exports / "assay/standards_fit_per_chamber.csv", index=False)
+            self.standards_fit = cal
+            self.nadh = predict_conc_pbp(self.nadh, cal, "chamber_ROI_median", out="nadh_uM", max_frac=self.pbp_max_frac)
+            self.value = "nadh_uM"
+            ok = cal["slope"].notna()
+            sat = self.nadh["nadh_uM_saturated"]
+            note(f"**Standards** (PBP, [Pi]) · {int(ok.sum()):,} of {len(cal):,} chambers, {self.standards['nadh_uM'].nunique()} standards · "
+                 f"sensor {cal.attrs['p_total']:.1f} µM active, Kd {cal.attrs['kd']:.2g} µM (chip-wide) · median low-[Pi] slope "
+                 f"{cal.loc[ok, 'slope'].median():,.1f} RFU/µM, r² {cal.loc[ok, 'r2'].median():.3f} · {int(sat.sum()):,} of {len(sat):,} "
+                 f"passes above {self.pbp_max_frac:.0%} of the sensor (near its plateau): no [Pi]")
+            self.save_fig(self._pbp_figure(cal), "4_standards", "4a_pbp_standards")
+            return None
+        if self.standards_model != "line":
+            raise ValueError(f"STANDARDS_MODEL: 'line' or 'pbp', not {self.standards_model!r}")
+        cal = fit_standard_lines(self.standards, "chamber_ROI_median", x="nadh_uM", keep=("tag",), conc_max=self.conc_max)
+        cal.to_csv(self.exports / "assay/standards_fit_per_chamber.csv", index=False)
+        self.standards_fit = cal
         self.nadh = predict_conc(self.nadh, cal, "chamber_ROI_median", out="nadh_uM")
         self.value = "nadh_uM"
         ok = cal["slope"].notna()
-        note(f"**NADH calibration** · {int(ok.sum()):,} of {len(cal):,} chambers, {self.standards['nadh_uM'].nunique()} standards · "
+        note(f"**Standards** (NADH, a line per chamber) · {int(ok.sum()):,} of {len(cal):,} chambers, {self.standards['nadh_uM'].nunique()} standards · "
              f"median slope {cal.loc[ok, 'slope'].median():,.1f} RFU/µM, r² {cal.loc[ok, 'r2'].median():.3f}")
 
+    calibrate = fit_standards   # the name before 2026-11-20
+
+    def _pbp_figure(self, cal):
+        """The PBP standards' fit: the chip's median standard curve (normalized per chamber) with the isotherm, and example
+        chambers (best, median and worst r²) with their own fits."""
+        import matplotlib.pyplot as plt
+
+        from .analysis.standards import bound_complex
+
+        P, Kd = cal.attrs["p_total"], cal.attrs["kd"]
+        st = self.standards.merge(cal[KEYS + ["intercept", "slope", "r2"]], on=KEYS)
+        st["norm"] = (st["chamber_ROI_median"] - st["intercept"]) / st["slope"]   # µM bound, per chamber
+        xs = np.linspace(0, st["nadh_uM"].max() * 1.05, 300)
+        fig, axes = plt.subplots(1, 4, figsize=(16, 3.8))
+        ax = axes[0]
+        g = st.groupby("nadh_uM")["norm"]
+        ax.errorbar(g.median().index, g.median(), yerr=[g.median() - g.quantile(.25), g.quantile(.75) - g.median()], fmt="o", color="k", ms=4)
+        ax.plot(xs, bound_complex(xs, P, Kd), color="#2E86C1", label=f"isotherm: {P:.1f} µM sensor, Kd {Kd:.2g} µM")
+        ax.plot(xs, xs, color="0.6", ls=":", lw=0.8, label="linear (no saturation)")
+        ax.axhline(self.pbp_max_frac * P, color="#C0392B", ls="--", lw=0.8, label=f"{self.pbp_max_frac:.0%} of the sensor: no [Pi] above")
+        ax.set(xlabel="[Pi] (µM)", ylabel="signal − intercept, / slope (µM bound)", ylim=(0, None))
+        ax.set_title("every chamber (median, IQR)", loc="left", fontsize=10)
+        ax.legend(frameon=False, fontsize=7)
+        ok = cal.dropna(subset=["r2"]).sort_values("r2")
+        for ax, (name, row) in zip(axes[1:], (("worst r²", ok.iloc[0]), ("median r²", ok.iloc[len(ok) // 2]), ("best r²", ok.iloc[-1]))):
+            d = st[(st["mark_row"] == row["mark_row"]) & (st["mark_col"] == row["mark_col"])]
+            ax.plot(d["nadh_uM"], d["chamber_ROI_median"], "o", color="k", ms=4)
+            ax.plot(xs, row["intercept"] + row["slope"] * bound_complex(xs, P, Kd), color="#2E86C1")
+            ax.set(xlabel="[Pi] (µM)", ylabel="chamber ROI median (RFU)")
+            ax.set_title(f"{name}: {row['tag']} r{int(row['mark_row']) + 1} c{int(row['mark_col']) + 1}, r² {row['r2']:.3f}", loc="left", fontsize=9)
+        fig.tight_layout()
+        return fig
+
     # ------------------------------------------------------------------ 3. rates
+    @each_series
     def fit_rates(self):
         """Initial rates: photobleaching from the BLANKs per run (exponential loss to a floor, per exposure), then a 4PL
         and a line per chamber and run (hp.fit_progress_curves, hp.PROGRESS_4PL_RULES with `rate_rules`); complete
@@ -340,7 +513,7 @@ class Analysis:
             return note("No assay table (`4_exports/assay/nadh_per_chamber.csv`): skipped")
         d = self.nadh[self.nadh["complete_pass"].astype(bool)] if "complete_pass" in self.nadh else self.nadh
         if self.tiles is not None and self.drop_flagged_tiles:
-            bad = pd.concat([self._in_flagged_tile(g, f"assay {s:g} µM", frame="frame") for s, g in d.groupby(self.substrate)])
+            bad = pd.concat([self._in_flagged_tile(g, self._run_label(s), frame="frame") for s, g in d.groupby(self.substrate)])
             if bad.any():
                 note(f"{int(bad.sum()):,} chamber passes in a tile flagged on that pass (1-Process tile check): left out of the fits")
                 d = d[~bad.reindex(d.index).to_numpy()]
@@ -349,11 +522,11 @@ class Analysis:
         kw = dict(per=(self.substrate, *KEYS), substrate=self.substrate if self.value == "nadh_uM" else None, **self.rate_rules)
         parts, fits, curves, uncorrected = [], {}, {}, []
         for s_uM, g in d.groupby(self.substrate):
-            tr, ra = fit_progress_curves(g, self.value, **kw)
+            tr, ra = fit_progress_curves(g, self.value, progress=f"{s_uM:g} µM: line and 4PL", **kw)
             bf = tr.attrs.get("bleach_fit", {}).get(s_uM)
             # too few flat BLANKs, or a fit on its bound (the "flat" BLANKs still rising): no correction
             if bf is not None and (bf["n_ref"] < self.min_bleach_blanks or abs(bf["amplitude"]) >= 0.49):
-                tr, ra = fit_progress_curves(g, self.value, bleach=None, **kw)
+                tr, ra = fit_progress_curves(g, self.value, bleach=None, progress=f"{s_uM:g} µM: refit, no bleach correction", **kw)
                 uncorrected.append((s_uM, bf))
             elif bf is not None:
                 fits[s_uM] = bf
@@ -362,6 +535,17 @@ class Analysis:
         traces = pd.concat([t for t, _ in parts], ignore_index=True)
         traces.attrs = {"bleach_curve": curves, "bleach_fit": fits}
         rates = pd.concat([r for _, r in parts], ignore_index=True)
+        if self.depleted_early == "force":
+            # a fast chamber whose substrate is largely used up by the first image keeps the line, which reads it low:
+            # flagged, its v0 becomes the 4PL's steepest slope inside the run (model "4pl_forced"; never extrapolated)
+            from .analysis.rates import flag_early_depletion, force_4pl_on_depleted
+            per = (self.substrate, *KEYS)
+            rates = force_4pl_on_depleted(flag_early_depletion(rates, d, per=per), d, per=per, rate="v0")
+            n_forced = rates[rates["model"] == "4pl_forced"].groupby(self.substrate).size()
+            note("**Depleted early** (slowing at the first image; v0 from the 4PL inside the run): "
+                 + (", ".join(f"{s:g} µM: {n}" for s, n in n_forced.items()) or "none"))
+        elif self.depleted_early is not None:
+            raise ValueError(f"DEPLETED_EARLY: None or 'force', not {self.depleted_early!r}")
         all_bleach = {**fits, **{s_uM: dict(bf, used=False) for s_uM, bf in uncorrected}}
         for s_uM, bf in uncorrected:
             why = (f"only {bf['n_ref']} BLANKs flat enough to model it ({bf['n_left_out']} rising faster than "
@@ -370,7 +554,7 @@ class Analysis:
             note(f"**{s_uM:g} µM: no bleach correction** · {why}")
         if self.enzyme is not None:
             rates = rates.merge(self.enzyme[KEYS + ["gfp", "expressing"]], on=KEYS, how="left")
-        rates.to_csv(self.exports / "assay/nadh_rates_per_chamber.csv", index=False)
+        rates.to_csv(self.exports / f"assay/nadh_rates_per_chamber{self._sfx}.csv", index=False)
         self.traces, self.rates = traces, rates
         unit = "µM/s" if self.value == "nadh_uM" else "RFU/s"
         self.rate_unit = unit
@@ -379,7 +563,7 @@ class Analysis:
         note(f"**Initial rates** · `{self.value}`, {len(self._runs)} runs, complete passes only · v0 from the 4PL "
              f"where every rule holds, else the line")
         summ = rates.assign(grp=rates["tag"].where(rates["tag"].isin(CONTROLS), "library")).groupby([self.substrate, "grp"]).agg(
-            chambers=("v0", "size"), by_4pl=("model", lambda m: int((m == "4pl").sum())), median_v0=("v0", "median")).unstack("grp")
+            chambers=("v0", "size"), by_4pl=("model", lambda m: int(m.isin(["4pl", "4pl_forced"]).sum())), median_v0=("v0", "median")).unstack("grp")
         summ.index = [f"{v:g} µM" for v in summ.index]
         for s_uM, bf in bleach.items():
             summ.loc[f"{s_uM:g} µM", ("bleaching", "% lost")] = 100 * bf["amplitude"]
@@ -392,17 +576,19 @@ class Analysis:
                                                                  "BLANKs used": "{:,.0f}", "BLANKs left out (rising)": "{:,.0f}"})
         # one figure per kind, a panel per run; every chamber's fit: one PDF per run in traces/
         runs = sorted(traces[self.substrate].unique())
-        folder = "5_assay/5d-rates"
+        folder = f"5_assay/5d-rates{self._sfx}"
         self.save_fig(self._bleach_figure(traces, runs, all_bleach), folder, "5d_bleaching")
         self.save_fig(chip_heatmaps(rates, "v0", panel=self.substrate, cmap="Blues", blanks=False, ncols=len(runs),
                                     title=f"initial rate per chamber (v0, {unit}), by [S] (µM)"), folder, "5d_v0_maps")
         self.save_fig(self._examples_figure(traces, rates, runs), folder, "5d_example_fits")
-        for s_uM in runs:
+        from .progress import track
+
+        for s_uM in track(runs, "every chamber's fit (PDF per run)", unit="run"):
             run, r = traces[traces[self.substrate] == s_uM], rates[rates[self.substrate] == s_uM]
             fig = chip_sparklines(run, f"{self.value}_bc", sharey="span", **progress_fit_overlays(run, r, f"{self.value}_bc"),
                                   title=f"progress curves and the fits that gave each initial rate, {s_uM:g} µM")
             self.save_fig(fig, f"{folder}/traces", f"5d_traces_and_fits_{s_uM:g}uM", show=False, exts=("pdf",))
-        note("Every chamber's fit, one PDF per run: `5_figures/qc/5_assay/5d-rates/traces/`")
+        note(f"Every chamber's fit, one PDF per run: `5_figures/qc/{folder}/traces/`")
 
     def _bleach_figure(self, traces, runs, fits):
         """The BLANKs relative to their first exposure, per run, with the bleaching model where one was used."""
@@ -457,6 +643,7 @@ class Analysis:
                                   unit="µM" if self.value == "nadh_uM" else "RFU")
 
     # ------------------------------------------------------------------ 3b. rate vs enzyme
+    @each_series
     def rates_vs_enzyme(self):
         """Initial rate against the enzyme on the button, per run (Spearman ρ over the buttons above the floor).
         QC 5_assay/5d-rates/5d_v0_vs_enzyme_<[S]>."""
@@ -484,11 +671,12 @@ class Analysis:
         axes[0, 0].legend(frameon=False, fontsize=7, markerscale=2)
         fig.suptitle("initial rate vs the enzyme on the button (ρ: Spearman, buttons above the floor)", x=0.01, ha="left", fontsize=11)
         fig.tight_layout()
-        self.save_fig(fig, "5_assay/5d-rates", "5d_v0_vs_enzyme")
+        self.save_fig(fig, f"5_assay/5d-rates{self._sfx}", "5d_v0_vs_enzyme")
         note("**Initial rate vs the enzyme on the button**")
         table(pd.DataFrame(rows).T, fmt={"buttons above the floor": "{:,.0f}", "Spearman ρ": "{:.2f}"})
 
     # ------------------------------------------------------------------ 4. Michaelis–Menten
+    @each_series
     def fit_mm(self):
         """v0 / [E] (buttons above the floor only) and one Michaelis–Menten fit per chamber across the [S] runs, raw and
         per enzyme. Needs ≥ 3 [S] runs. Writes 4_exports/assay/mm_per_chamber.csv and mm_per_gfp_per_chamber.csv."""
@@ -499,16 +687,16 @@ class Analysis:
             return note("Needs `fit_rates`: skipped")
         if len(self._runs) < 3:
             return note(f"{len(self._runs)} [S] run(s): Michaelis–Menten needs ≥ 3; skipped")
-        self.mm_raw = fit_mm_table(self.rates.rename(columns={"v0": "vmax"}), "vmax", s=self.substrate)
-        self.mm_raw.to_csv(self.exports / "assay/mm_per_chamber.csv", index=False)
+        self.mm_raw = fit_mm_table(self.rates.rename(columns={"v0": "vmax"}), "vmax", s=self.substrate, progress="Michaelis–Menten, raw")
+        self.mm_raw.to_csv(self.exports / f"assay/mm_per_chamber{self._sfx}.csv", index=False)
         if self.enzyme is not None:
             # per GFP: the buttons above the floor; and WT's below it too when it is the reference without the floor
             use = self.enzyme["expressing"] | ((self.enzyme["tag"] == "WT") & ~self.ref_needs_gfp_floor & (self.enzyme["gfp"] > 0))
             norm = normalize_rates(self.rates.drop(columns=["gfp", "expressing"], errors="ignore"), self.enzyme[use],
                                    rate="v0", by="gfp")
-            self.mm = fit_mm_table(norm.dropna(subset=["v0_per_gfp"]), "v0_per_gfp", s=self.substrate)
+            self.mm = fit_mm_table(norm.dropna(subset=["v0_per_gfp"]), "v0_per_gfp", s=self.substrate, progress="Michaelis–Menten, per GFP")
             self.norm = norm
-            self.mm.to_csv(self.exports / "assay/mm_per_gfp_per_chamber.csv", index=False)
+            self.mm.to_csv(self.exports / f"assay/mm_per_gfp_per_chamber{self._sfx}.csv", index=False)
         good = self.mm_raw["r2"] >= self.min_r2
         note(f"**Michaelis–Menten** · {len(self.mm_raw):,} chambers fit across {len(self._runs)} [S] runs · "
              f"{int(good.sum()):,} with r² ≥ {self.min_r2:g}")
@@ -516,6 +704,7 @@ class Analysis:
               fmt={"km": "{:,.0f}", "vmax": "{:.3g}", "r2": "{:.3f}"})
 
     # ------------------------------------------------------------------ 5. chamber report
+    @each_series
     def chamber_report(self, chambers=None, n_jobs=None):
         """One page per chamber (hp.report.chamber_report_pdf): crops of its button (the button GFP scan) and its chamber
         (the highest [S], last pass), every run's progress curve and fit, and the MM fits, raw and per GFP; buttons below
@@ -537,12 +726,17 @@ class Analysis:
         if not idx_path.exists():
             return note("No `4_exports/stitched_scans.json` (1-Process `stitch_all` writes it): skipped")
         idx = json.loads(idx_path.read_text())
-        missing = [l for l in (idx["button_scan"], idx["reference_run"]) if l and not Path(idx["scans"][l]["store"]).exists()]
+        # the chamber crop: this series' highest [S] run, last pass (else the chamber grid's run)
+        ref = self._run_label(max(self._runs)) if self._runs else None
+        ref = ref if ref in idx["scans"] else idx["reference_run"]
+        missing = [l for l in (idx["button_scan"], ref) if l and not Path(idx["scans"][l]["store"]).exists()]
         if missing:
             return note(f"The stitched images aren't reachable ({', '.join(missing)}): is the drive plugged in? Skipped")
         images, tile_px, captions = {}, {}, {}
         scan = getattr(self, "enzyme_scan", None) or idx["button_scan"]
-        for label, mask, what in ((scan, "button", "GFP, " + str(scan)), (idx["reference_run"], "chamber", f"NADH, {idx['reference_run'].replace('assay ', '')}, last pass")):
+        if scan not in idx["scans"] and f"GFP {scan}" in idx["scans"]:   # the GFP table's "post-binding" is the index's "GFP post-binding"
+            scan = f"GFP {scan}"
+        for label, mask, what in ((scan, "button", "GFP, " + str(scan)), (ref, "chamber", f"NADH, {(ref or '').replace('assay ', '')}, last pass")):
             if not label:
                 continue
             z = xr.open_zarr(idx["scans"][label]["store"], consolidated=False)
@@ -556,9 +750,9 @@ class Analysis:
             info = self.enzyme.set_index(KEYS)[["gfp"]].rename(columns={"gfp": "GFP"}).round(0)
         folder = self.figures / "4_report"
         folder.mkdir(parents=True, exist_ok=True)
-        for old in folder.glob("*_chamber_report_*.pdf"):
+        for old in folder.glob(f"*_chamber_report{self._sfx}_??????.pdf"):   # this series' older copies only
             old.unlink()
-        path = folder / f"{self.experiment}_chamber_report_{date.today():%y%m%d}.pdf"
+        path = folder / f"{self.experiment}_chamber_report{self._sfx}_{date.today():%y%m%d}.pdf"
         chambers = chambers or [(r, c) for r in range(self.n_rows) for c in range(self.n_cols)]
         norm = getattr(self, "norm", None)
         n = chamber_report_pdf(path, chambers, images=images, traces=self.traces, value=f"{self.value}_bc",
@@ -566,11 +760,12 @@ class Analysis:
                                mm_raw=self.mm_raw, mm=self.mm, norm=norm.dropna(subset=["v0_per_gfp"]) if norm is not None else None,
                                norm_col="v0_per_gfp" if norm is not None else None, info=info,
                                info_floors={"GFP": self.gfp_floor} if info is not None else None, km_min_r2=self.min_r2,
-                               tile_px=tile_px, image_captions=captions, rate_unit=self.rate_unit, experiment=self.experiment,
-                               n_jobs=n_jobs)   # default: half the cores; each gets only its chambers' crops
+                               tile_px=tile_px, image_captions=captions, rate_unit=self.rate_unit, experiment=self._report_title,
+                               n_jobs=n_jobs, substrate=self.substrate)   # default: half the cores; each gets only its chambers' crops
         note(f"**Chamber report** · {n:,} pages · `{path}` ({path.stat().st_size / 1e6:.0f} MB)")
 
     # ------------------------------------------------------------------ 6. experiment report
+    @each_series
     def experiment_report(self):
         """The chip-level report (hp.report.experiment_report_pdf) in 5_figures/4_report; one copy is kept (older ones
         are deleted). Needs fit_mm with the enzyme."""
@@ -582,12 +777,19 @@ class Analysis:
             return note("Needs `fit_mm` with the button GFP: skipped")
         folder = self.figures / "4_report"
         folder.mkdir(parents=True, exist_ok=True)
-        for old in folder.glob("*_experiment_report_*.pdf"):
+        for old in folder.glob(f"*_experiment_report{self._sfx}_??????.pdf"):   # this series' older copies only
             old.unlink()
-        path = folder / f"{self.experiment}_experiment_report_{date.today():%y%m%d}.pdf"
-        experiment_report_pdf(path, gfp=self.enzyme, rates=self.rates.drop(columns=["gfp", "expressing"], errors="ignore"), mm_raw=self.mm_raw, mm_per_gfp=self.mm, floor=self.gfp_floor,
-                              gfp_col="gfp", gfp_label=f"button GFP ({self.button_value})", experiment=self.experiment,
+        path = folder / f"{self.experiment}_experiment_report{self._sfx}_{date.today():%y%m%d}.pdf"
+        if self.volcano_reference not in ("WT", "library"):
+            raise ValueError(f"VOLCANO_REFERENCE: 'WT' or 'library', not {self.volcano_reference!r}")
+        lib_ref = self.volcano_reference == "library"
+        scan = self.enzyme_scan
+        experiment_report_pdf(path, substrate=self.substrate, gfp=self.enzyme, rates=self.rates.drop(columns=["gfp", "expressing"], errors="ignore"), mm_raw=self.mm_raw, mm_per_gfp=self.mm, floor=self.gfp_floor,
+                              gfp_col="gfp", gfp_label=f"{scan} GFP", experiment=self._report_title,
                               rate_unit=self.rate_unit, min_r2=self.min_r2,
-                              volcano_kw=dict(reference="WT", min_ref_chambers=self.min_ref_chambers, exclude=CONTROLS,   # controls aren't variants
+                              gfp_scan=scan, gfp_note=f"{self.button_value}. {self.button_scan_note}" if self.button_scan_note else "",
+                              reference_note=self.volcano_reference_note or ("set to the library median (VOLCANO_REFERENCE)" if lib_ref else ""),
+                              volcano_kw=dict(reference="WT", min_ref_chambers=10 ** 9 if lib_ref else self.min_ref_chambers,   # 'library': never enough WT
+                                              exclude=CONTROLS,   # controls aren't variants
                                               ref_require_expressed=self.ref_needs_gfp_floor))
         note(f"Report: `{path}`")
