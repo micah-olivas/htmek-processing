@@ -605,3 +605,45 @@ def center_on_template(image, cx, cy, *, half, reach=12, n_iter=2, min_score=0.5
             matched[idx] = True
         sx, sy = nx, ny
     return sx, sy, matched, score, template
+
+
+def template_offsets(image, cx, cy, *, radius=40, reach=15, smooth=5):
+    """Each grid point's offset to where the image best matches the mean pattern around the points: the median radial
+    profile of `image` within `radius` px of the given centers (e.g. a closed button, dark against the dye around it),
+    found by normalized cross-correlation within `reach` px; then each offset replaced by the median of its
+    `smooth` x `smooth` neighborhood on the chip grid (an image-to-image offset varies slowly across the chip, so a
+    stray match cannot move one point alone). cx, cy: (rows, cols) arrays. Returns (dx, dy, raw_dx, raw_dy) in px."""
+    from scipy import ndimage, signal
+
+    img = np.asarray(image, np.float32)
+    cx, cy = np.asarray(cx, float), np.asarray(cy, float)
+    yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    rr = np.hypot(xx, yy)
+    ring = np.minimum(np.round(rr), radius).astype(int)
+    profs = []
+    for x, y in zip(np.round(cx.ravel()).astype(int), np.round(cy.ravel()).astype(int)):
+        p = img[y - radius:y + radius + 1, x - radius:x + radius + 1]
+        if p.shape == rr.shape:
+            profs.append(ndimage.mean(p, ring, index=np.arange(radius + 1)))
+    prof = np.median(profs, axis=0)
+    inside = rr <= radius
+    t = np.where(inside, np.interp(rr, np.arange(radius + 1), prof), 0.0)
+    t = np.where(inside, t - t[inside].mean(), 0.0)
+    tnorm = np.sqrt((t ** 2).sum())
+    mk = inside.astype(float)
+    w = radius + reach
+    raw = np.full(cx.shape + (2,), np.nan)
+    for (i, j), x, y in zip(np.ndindex(cx.shape), np.round(cx.ravel()).astype(int), np.round(cy.ravel()).astype(int)):
+        p = img[y - w:y + w + 1, x - w:x + w + 1]
+        if p.shape != (2 * w + 1, 2 * w + 1):
+            continue
+        p = p - p.mean()
+        num = signal.correlate(p, t, mode="valid")
+        s1 = signal.correlate(p, mk, mode="valid")
+        s2 = signal.correlate(p ** 2, mk, mode="valid")
+        ncc = num / (np.sqrt(np.maximum(s2 - s1 ** 2 / mk.sum(), 1e-9)) * tnorm)
+        iy, ix = np.unravel_index(np.argmax(ncc), ncc.shape)
+        raw[i, j] = (ix - reach, iy - reach)
+    dx = ndimage.generic_filter(raw[..., 0], np.nanmedian, size=smooth, mode="nearest")
+    dy = ndimage.generic_filter(raw[..., 1], np.nanmedian, size=smooth, mode="nearest")
+    return np.nan_to_num(dx), np.nan_to_num(dy), raw[..., 0], raw[..., 1]

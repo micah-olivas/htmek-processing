@@ -68,6 +68,7 @@ from .experiment import Experiment  # noqa: F401
 from .analysis_steps import Analysis, robust_floor  # noqa: F401
 from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure  # noqa: F401
 from .analysis.expression import expression_calls, blank_leakage, dna_chamber_diffusion, diffusion_figure  # noqa: F401
+from .analysis.labeling import labeling_table, labeling_figure, labeling_states_figure  # noqa: F401
 from .report.expression import expression_report  # noqa: F401
 from .processing.grid import (  # noqa: F401
     grid_centers,
@@ -263,6 +264,9 @@ __all__ = [
     "tile_of",
     "tile_figure",
     "diffusion_figure",
+    "labeling_table",
+    "labeling_figure",
+    "labeling_states_figure",
     "expression_report",
     "write_raw_readme",
     "tile_seam_flags",
