@@ -29,6 +29,10 @@ interactive = [
 magnify = [
     "magnify>=0.12",
 ]
+# the interactive plot-and-structure page (viz.structure_interactive)
+viz = [
+    "plotly>=5.18",
+]
 
 [build-system]
 requires = ["hatchling"]
