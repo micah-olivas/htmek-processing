@@ -67,7 +67,7 @@ from .notebooks import create_experiment_notebooks  # noqa: F401
 from .experiment import Experiment  # noqa: F401
 from .analysis_steps import Analysis, robust_floor  # noqa: F401
 from . import viz  # noqa: F401  (plotly is imported only when a page is built)
-from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure  # noqa: F401
+from .processing.tiles import tile_medians, tile_deviations, tile_of, tile_figure, row_gains, hot_rows, row_period, hot_row_mask, hot_row_figure  # noqa: F401
 from .analysis.expression import expression_calls, blank_leakage, dna_chamber_diffusion, diffusion_figure  # noqa: F401
 from .analysis.labeling import labeling_table, labeling_figure, labeling_states_figure  # noqa: F401
 from .report.expression import expression_report  # noqa: F401
@@ -264,6 +264,11 @@ __all__ = [
     "tile_deviations",
     "tile_of",
     "tile_figure",
+    "row_gains",
+    "hot_rows",
+    "row_period",
+    "hot_row_mask",
+    "hot_row_figure",
     "diffusion_figure",
     "labeling_table",
     "labeling_figure",
