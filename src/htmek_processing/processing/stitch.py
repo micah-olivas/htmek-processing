@@ -84,6 +84,34 @@ def _gap_trims(overlap, n, split=False):
     return lead, trail
 
 
+def place_tiles(tiles, origin, shape, fill_gaps=False):
+    """Paste a grid of tiles into one image of `shape` (Y, X), each tile's pixel (0, 0) at its own `origin`
+    ((R, C, 2) array of (y0, x0), whole px), row by row: where neighbors overlap the later tile is kept. Px no tile
+    reaches (a gap of a few px at a seam, the uneven outer edge) stay 0 (NaN in a float image), or with `fill_gaps`
+    take the nearest imaged px. `tiles` is (row, col, y, x), or (time, row, col, y, x). No interpolation."""
+    tiles = np.asarray(tiles)
+    *lead, R, C, h, w = tiles.shape
+    out = np.full((*lead, *shape), np.nan if np.issubdtype(tiles.dtype, np.floating) else 0, dtype=tiles.dtype)
+    origin = np.asarray(origin, int)
+    for r in range(R):
+        for c in range(C):
+            y0, x0 = origin[r, c]
+            ys, xs = slice(max(y0, 0), min(y0 + h, shape[0])), slice(max(x0, 0), min(x0 + w, shape[1]))
+            out[..., ys, xs] = tiles[..., r, c, ys.start - y0: ys.stop - y0, xs.start - x0: xs.stop - x0]
+    if fill_gaps:   # px between tiles that no tile reached (a gap of a few px at a seam): the nearest imaged px
+        from scipy import ndimage
+
+        covered = np.zeros(shape, bool)
+        for r in range(R):
+            for c in range(C):
+                y0, x0 = origin[r, c]
+                covered[max(y0, 0): y0 + h, max(x0, 0): x0 + w] = True
+        if not covered.all():
+            _, (iy, ix) = ndimage.distance_transform_edt(~covered, return_indices=True)
+            out[..., ~covered] = out[..., iy[~covered], ix[~covered]]
+    return out
+
+
 def stitch_tiles(tiles, overlap, split=False):
     """Stitch a grid of tiles into one image by trimming each tile's trailing overlap and
     butting the tiles together (magnify's stitch convention).
@@ -198,7 +226,11 @@ def _stitch_frame(job):
     if missing.any() and np.issubdtype(dtype, np.floating):
         frame = frame.astype(dtype, copy=True)
         frame[missing] = np.nan
-    zarr.open_array(job["dst"], mode="r+")[idx] = stitch_tiles(frame, job["ov"], split=job["split"])
+    if job.get("origin") is not None:   # each tile at its own origin (lattice_tile_origins)
+        stitched = place_tiles(frame, job["origin"], job["shape"], fill_gaps=True)
+    else:
+        stitched = stitch_tiles(frame, job["ov"], split=job["split"])
+    zarr.open_array(job["dst"], mode="r+")[idx] = stitched
 
 
 def _offset_value(offset):
@@ -253,6 +285,10 @@ def stitch_to_zarr(
     tile row's and column's origin in the stitched image (attrs tile_y0, tile_x0) and where
     the tiles meet (attrs seams_y, seams_x).
 
+    A geometry dict with `tile_origin` ((R, C, 2) (y0, x0) px, e.g. from legacy.lattice_tile_origins) places each tile
+    at its own origin instead (place_tiles: no rotation, later tiles kept where neighbors overlap): for stages whose
+    tiles don't sit on one grid. tile_y0 / tile_x0 and the seams are then each row's and column's median.
+
     `offset` (RFU) is the camera's offset, subtracted from every tile first: a scalar, or a per-pixel dark
     image the size of one camera tile (array or path; e.g. MBO-053's measured darks). Use it with a
     flatfield scaled to mean 1 (e.g. BaSiC's), which has no offset of its own. (`darkfield` is
@@ -301,14 +337,28 @@ def stitch_to_zarr(
         ov = overlap_px(tiled, overlap)
     oy, ox = ov if isinstance(ov, tuple) else (ov, ov)
     split = bool(rotation_deg)  # rotated tiles have no data at their edges: drop both edges
-    (lead_y, trail_y), (lead_x, trail_x) = _gap_trims(oy, R, split), _gap_trims(ox, C, split)
-    kept_y = tiled.sizes["y"] - lead_y - trail_y
-    kept_x = tiled.sizes["x"] - lead_x - trail_x
-    # where each tile's own pixel (0, 0) lands in the stitched image
-    tile_y0 = np.r_[0, np.cumsum(kept_y)[:-1]] - lead_y
-    tile_x0 = np.r_[0, np.cumsum(kept_x)[:-1]] - lead_x
-    height, width = int(kept_y.sum()), int(kept_x.sum())
-    step = int(round(height / R)), int(round(width / C))  # mean stitched tile pitch (y, x)
+    origin = np.asarray(overlap["tile_origin"], int) if isinstance(overlap, dict) and overlap.get("tile_origin") is not None else None
+    if origin is not None:
+        if rotation_deg:
+            raise ValueError("tile_origin placement takes unrotated tiles (rotation_deg 0)")
+        h, w = tiled.sizes["y"], tiled.sizes["x"]
+        origin = origin - origin.reshape(-1, 2).min(0)
+        height, width = int(origin[..., 0].max() + h), int(origin[..., 1].max() + w)
+        tile_y0 = np.median(origin[..., 0], axis=1).round().astype(int)   # per tile row / column: the median origin
+        tile_x0 = np.median(origin[..., 1], axis=0).round().astype(int)
+        seams_y = ((tile_y0[1:] + tile_y0[:-1] + h) // 2).tolist()   # the middle of each overlap (or gap)
+        seams_x = ((tile_x0[1:] + tile_x0[:-1] + w) // 2).tolist()
+        step = int(round(height / R)), int(round(width / C))
+    else:
+        (lead_y, trail_y), (lead_x, trail_x) = _gap_trims(oy, R, split), _gap_trims(ox, C, split)
+        kept_y = tiled.sizes["y"] - lead_y - trail_y
+        kept_x = tiled.sizes["x"] - lead_x - trail_x
+        # where each tile's own pixel (0, 0) lands in the stitched image
+        tile_y0 = np.r_[0, np.cumsum(kept_y)[:-1]] - lead_y
+        tile_x0 = np.r_[0, np.cumsum(kept_x)[:-1]] - lead_x
+        height, width = int(kept_y.sum()), int(kept_x.sum())
+        seams_y, seams_x = np.cumsum(kept_y)[:-1].tolist(), np.cumsum(kept_x)[:-1].tolist()
+        step = int(round(height / R)), int(round(width / C))  # mean stitched tile pitch (y, x)
 
     # lay out the store (metadata only, nothing computed), then fill it frame by frame
     offset_src = offset if isinstance(offset, (str, Path)) else None
@@ -328,8 +378,14 @@ def stitch_to_zarr(
     ds.attrs.update(tile_px=list(step), source=str(src),
                     overlap_px=ov if np.isscalar(ov) else [np.asarray(v, float).tolist() for v in ov],
                     tile_y0=tile_y0.tolist(), tile_x0=tile_x0.tolist(),
-                    seams_y=np.cumsum(kept_y)[:-1].tolist(),  # where tile rows meet (px)
-                    seams_x=np.cumsum(kept_x)[:-1].tolist())  # where tile columns meet
+                    seams_y=seams_y,  # where tile rows meet (px)
+                    seams_x=seams_x)  # where tile columns meet
+    if origin is not None:
+        ds.attrs["tile_origin"] = origin.tolist()
+        cov = np.zeros((height, width), bool)
+        for (y0, x0) in origin.reshape(-1, 2):
+            cov[y0: y0 + tiled.sizes["y"], x0: x0 + tiled.sizes["x"]] = True
+        ds.attrs["gap_px_filled"] = int((~cov).sum())   # px no tile reached, filled from the nearest imaged px
     if flatfield is not None:
         ds.attrs.update(
             flatfield=str(flatfield) if isinstance(flatfield, (str, Path)) else "array",
@@ -366,7 +422,7 @@ def stitch_to_zarr(
 
     job = dict(src=str(src), channel=channel, lead=lead, offset=offset, flatfield=flatfield, darkfield=darkfield,
                bg_tiles=bg_tiles, rotation_deg=rotation_deg, dtype=np.dtype(dtype).str, ov=ov, split=split,
-               dst=str(dst / "image"))
+               dst=str(dst / "image"), origin=None if origin is None else origin.tolist(), shape=(height, width))
     frames = list(np.ndindex(*lead_shape))   # a single empty index for a snapshot
     n_jobs = min(n_jobs or max(1, min(6, (os.cpu_count() or 2) // 2)), len(frames))
     if n_jobs > 1:   # frames are independent and fill separate chunks: one worker process per frame
@@ -662,3 +718,61 @@ def flatfield_correct(
     subtract = dark if background is None else np.asarray(background, float)
     corr = (a - subtract) / fd
     return corr * fd.mean() if normalize else corr
+
+
+def acquisition_times(raw_path):
+    """(start, end) of a raw acquisition, as naive local datetimes, from its tiles' `timestamp` arrays (microseconds; the
+    acquisition software writes local time in the UTC field), or (None, None) when it has none."""
+    import glob
+
+    import pandas as pd
+    import zarr
+
+    found = []
+    for p in glob.glob(os.path.join(str(raw_path), "**", "timestamp", "zarr.json"), recursive=True):
+        t = np.asarray(zarr.open(os.path.dirname(os.path.dirname(p)), mode="r")["timestamp"][:]).ravel()
+        found.append(t[t > 1e15])
+    if not found or not np.concatenate(found).size:
+        return None, None
+    t = np.concatenate(found)
+    return pd.to_datetime(int(t.min()), unit="us"), pd.to_datetime(int(t.max()), unit="us")
+
+
+def export_stitched_tiff(store, path, *, frames=None, px_um=None, note=None):
+    """Write a stitched store (path or stitch_run's dict) as an ImageJ TIFF: float32, one page per pass of a time series
+    (`frames`: indices, default all; a snapshot: one page), with every attribute of the store in the Info field (the
+    acquisition's: channel, exposure, power, its code; the stitching's: source, tile pitch, seams, rotation, offset,
+    flatfield) plus the acquisition's start and end time from its raw tiles' timestamps, and `note`. `px_um` sets the
+    pixel size (µm). Returns the path."""
+    import tifffile
+    import xarray as xr
+
+    ds = xr.open_zarr(store, consolidated=False) if isinstance(store, (str, Path)) else store["store"]
+    da = ds["image"]
+    if "time" in da.dims:
+        da = da.isel(time=list(frames) if frames is not None else slice(None))
+    img = np.asarray(da.values, np.float32)
+    attrs = {k: v for k, v in ds.attrs.items()}
+    start, end = acquisition_times(attrs["source"]) if attrs.get("source") else (None, None)
+    lines = [f"stitched store: {store if isinstance(store, (str, Path)) else ''}".rstrip(": ")]
+    if start is not None:
+        lines.append(f"acquired: {start:%Y-%m-%d %H:%M:%S} to {end:%Y-%m-%d %H:%M:%S} (local)")
+    if frames is not None and img.ndim == 3:
+        lines.append(f"passes: {list(frames)}")
+    if note:
+        lines.append(str(note))
+    code = attrs.pop("acq_func", None)
+    lines += [f"{k}: {v}" for k, v in attrs.items()]
+    if code:
+        lines += ["acq_func:", str(code)]
+    sample = img[..., ::8, ::8]
+    lo, hi = np.percentile(sample[np.isfinite(sample)], [1, 99.7])
+    meta = {"Info": "\n".join(lines), "min": float(lo), "max": float(hi)}
+    kw = {}
+    if px_um:
+        meta["unit"] = "um"
+        kw["resolution"] = (1 / px_um, 1 / px_um)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(path, img, imagej=True, metadata=meta, **kw)
+    return path

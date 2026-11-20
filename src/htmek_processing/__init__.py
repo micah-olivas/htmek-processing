@@ -58,6 +58,8 @@ from .processing.stitch import (  # noqa: F401
     split_channel,
     flatfield_from_tiles,
     flatfield_correct,
+    export_stitched_tiff,
+    acquisition_times,
 )
 from .processing.protocol_log import read_protocol_log, protocol_summary  # noqa: F401
 from .processing.provenance import record_raw_source, write_raw_readme  # noqa: F401
@@ -253,6 +255,8 @@ __all__ = [
     "Analysis",
     "robust_floor",
     "tile_medians",
+    "export_stitched_tiff",
+    "acquisition_times",
     "tile_deviations",
     "tile_of",
     "tile_figure",

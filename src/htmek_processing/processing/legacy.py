@@ -182,19 +182,153 @@ def read_legacy_tiles(src, dst, *, overlap, positions="filename", mirror_cols=Tr
 
 def legacy_geometry(path, src, *, overlap_px=0, rotation_deg=0.0):
     """Write the seam geometry of a legacy scan to `path` (the JSON stitch_geometry reads), so stitch_run places its
-    tiles `overlap_px` apart (0: butted, as the 2024 pipeline did) instead of measuring the seams, which needs an
-    overlap. `src` is the converted store (read_legacy_tiles' return value), for the grid size. Returns the dict."""
+    tiles with a fixed overlap instead of measuring the seams. `overlap_px` is one number for both axes (0: butted, as
+    the 2024 pipeline did) or (overlap_y, overlap_x): px shared at the row seams and at the column seams. Use it where
+    the seams can't be measured: no overlap, or an overlap too small to register against a repeating chamber lattice
+    (MBO-R02: 3 px at the rows and 11 px at the columns; a seam search there locks onto the 115 px row pitch). `src` is
+    the converted store (read_legacy_tiles' return value), for the grid size. Returns the dict."""
     import json
 
     from .stitch import open_tiled
 
     tiled = open_tiled(src)
     R, C = tiled.sizes["row"], tiled.sizes["col"]
-    geometry = dict(overlap_y=[float(overlap_px)] * (R - 1), overlap_x=[float(overlap_px)] * (C - 1),
+    oy, ox = (overlap_px, overlap_px) if np.isscalar(overlap_px) else overlap_px
+    geometry = dict(overlap_y=[float(oy)] * (R - 1), overlap_x=[float(ox)] * (C - 1),
                     cross_dy=0.0, cross_dx=0.0, spread_y=[0.0] * (R - 1), spread_x=[0.0] * (C - 1),
-                    measured_on=f"not measured: legacy scan, tiles placed {overlap_px} px apart (legacy_geometry)",
+                    measured_on=f"not measured: legacy scan, tiles overlapping {oy:g} px at the rows and {ox:g} px at the "
+                                "columns (legacy_geometry)",
                     rotation_deg=rotation_deg)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(geometry, indent=1))
     return geometry
+
+
+def _lattice_phase(profile, coords, period):
+    """The phase (px, in [0, period)) of a periodic profile sampled at `coords`: where its fundamental peaks."""
+    p = np.asarray(profile, float) - np.mean(profile)
+    z = (p * np.exp(-2j * np.pi * np.asarray(coords, float) / period)).sum()
+    return (-np.angle(z) / (2 * np.pi) * period) % period
+
+
+def lattice_period(profile, lo, hi, n=2001):
+    """The period (px) of a periodic profile, searched continuously in [lo, hi]: the period whose fundamental has the most
+    power (an FFT's bins are too coarse: 1024 / k px)."""
+    p = np.asarray(profile, float) - np.mean(profile)
+    x = np.arange(len(p))
+    periods = np.linspace(lo, hi, n)
+    power = [abs((p * np.exp(-2j * np.pi * x / per)).sum()) for per in periods]
+    return float(periods[int(np.argmax(power))])
+
+
+def lattice_tile_origins(src, *, pitch_x, pitch_y, overlap_px=0.0, frame=-1, strip=400, cross_strip=200):
+    """Each tile's origin in the stitched image, from the chip's own chamber lattice: for tiles whose seams can't be
+    registered directly (an overlap too small for phase correlation, or a repeating lattice the registration locks onto
+    a pitch away; MBO-R02, Setup 7 2025: 2-16 px overlaps, a seam search found the 115 px row pitch).
+
+    At every seam the lattice's phase is read on both tiles near the seam (`strip` px; the cross-seam phase on
+    `cross_strip` px): along the seam's axis it gives the tiles' spacing modulo the pitch, taken within half a pitch of
+    the nominal `overlap_px`; across it, the sideways shift, within half a pitch of 0. The 2 x (R (C - 1) + (R - 1) C)
+    spacings are then solved for the R x C origins by least squares (tile (0, 0) at 0), refit once without seams off
+    by more than 3 robust SDs. `pitch_x`, `pitch_y` (px) bound the lattice period search, each a (lo, hi) range or a
+    number (searched +-3%); the chip's lattice must be visible on `frame` (a bright, uniformly filled scan: a standard).
+
+    Returns a dict for stitch_to_zarr(overlap=...): tile_origin ((R, C, 2) list, (y0, x0) px, the smallest 0),
+    overlap_y / overlap_x (the median per gap, for the stores' attrs), pitch, the seams' residuals (residual_px:
+    median and max), and the seams measured (seams: column and row seams' along / cross values)."""
+    from .stitch import open_tiled
+
+    tiled = open_tiled(src)
+    tiles = tiled["tile"].squeeze([d for d in tiled["tile"].dims[:-4] if tiled.sizes[d] == 1])
+    if tiles.ndim == 5:
+        tiles = tiles.isel({tiles.dims[0]: frame})
+    out = tile_origins_from_lattice(np.asarray(tiles.values, float), pitch_x=pitch_x, pitch_y=pitch_y,
+                                    overlap_px=overlap_px, strip=strip, cross_strip=cross_strip)
+    out["measured_on"] = f"{Path(src).name}, frame {frame}: tiles placed on the chamber lattice (lattice_tile_origins)"
+    return out
+
+
+def tile_origins_from_lattice(T, *, pitch_x, pitch_y, overlap_px=0.0, strip=400, cross_strip=200, rounds=2):
+    """lattice_tile_origins on a tile array `T` (row, col, y, x) in memory; see there. The lattice pitch is first
+    read on the tiles (a few periods each), then on the mosaic the first placement gives (`rounds` - 1 times): the
+    seams' phases sit about a pitch apart, so a pitch error enters every seam once."""
+    from .stitch import place_tiles
+
+    T = np.asarray(T, float)
+    R, C, h, w = T.shape
+    rng = lambda p: (p[0], p[1]) if np.ndim(p) else (p * 0.97, p * 1.03)
+    px = np.median([lattice_period(T[r, c].mean(0), *rng(pitch_x)) for r in range(R) for c in range(C)])
+    py = np.median([lattice_period(T[r, c].mean(1), *rng(pitch_y)) for r in range(R) for c in range(C)])
+    for k in range(rounds):
+        out = _origins_one_pass(T, px, py, overlap_px, strip, cross_strip)
+        if k < rounds - 1:
+            o = np.asarray(out["tile_origin"])
+            mosaic = place_tiles(T.astype(np.float32), o, (int(o[..., 0].max() + h), int(o[..., 1].max() + w)))
+            mosaic = np.nan_to_num(mosaic, nan=float(np.nanmedian(mosaic)))
+            px = lattice_period(mosaic.mean(0), px * 0.99, px * 1.01, n=4001)
+            py = lattice_period(mosaic.mean(1), py * 0.99, py * 1.01, n=4001)
+    return out
+
+
+def _origins_one_pass(T, px, py, overlap_px, strip, cross_strip):
+    """One placement of the tiles at a given lattice pitch (px, py): the seams' phases, then least squares."""
+    R, C, h, w = T.shape
+    wrap = lambda v, per, centre: (v - centre + per / 2) % per - per / 2 + centre
+    xs, ys = np.arange(w), np.arange(h)
+    eqs = {"x": [], "y": []}   # (tile a, tile b, measured origin_b - origin_a)
+    seams = {"columns": np.full((R, C - 1, 2), np.nan), "rows": np.full((R - 1, C, 2), np.nan)}
+    for r in range(R):
+        for c in range(C):
+            a = T[r, c]
+            if c < C - 1:   # column seam: x spacing (along), y shift (across)
+                b = T[r, c + 1]
+                # phases read from the seam (a: x - w, b: x), so a slightly wrong pitch acts over the strip only
+                fa = _lattice_phase(a[:, w - strip:].mean(0), xs[w - strip:] - w, px)
+                fb = _lattice_phase(b[:, :strip].mean(0), xs[:strip], px)
+                ov = wrap(fb - fa, px, overlap_px)              # px shared: origin_b - origin_a = w - ov
+                ga = _lattice_phase(a[:, w - cross_strip:].mean(1), ys, py)
+                gb = _lattice_phase(b[:, :cross_strip].mean(1), ys, py)
+                d = wrap(ga - gb, py, 0.0)                     # origin_b - origin_a in y
+                eqs["x"].append(((r, c), (r, c + 1), w - ov))
+                eqs["y"].append(((r, c), (r, c + 1), d))
+                seams["columns"][r, c] = (ov, d)
+            if r < R - 1:   # row seam: y spacing (along), x shift (across)
+                b = T[r + 1, c]
+                fa = _lattice_phase(a[h - strip:].mean(1), ys[h - strip:] - h, py)
+                fb = _lattice_phase(b[:strip].mean(1), ys[:strip], py)
+                ov = wrap(fb - fa, py, overlap_px)
+                ga = _lattice_phase(a[h - cross_strip:].mean(0), xs, px)
+                gb = _lattice_phase(b[:cross_strip].mean(0), xs, px)
+                d = wrap(ga - gb, px, 0.0)
+                eqs["y"].append(((r, c), (r + 1, c), h - ov))
+                eqs["x"].append(((r, c), (r + 1, c), d))
+                seams["rows"][r, c] = (ov, d)
+    idx = lambda rc: rc[0] * C + rc[1]
+    origin, resid_all = np.zeros((R, C, 2)), []
+    for k, axis in enumerate(("y", "x")):
+        rows = eqs[axis]
+        A = np.zeros((len(rows) + 1, R * C))
+        y = np.zeros(len(rows) + 1)
+        for i, (ta, tb, v) in enumerate(rows):
+            A[i, idx(tb)], A[i, idx(ta)], y[i] = 1, -1, v
+        A[-1, 0] = 1   # tile (0, 0) at 0
+        keep = np.ones(len(y), bool)
+        for _ in range(2):
+            sol, *_ = np.linalg.lstsq(A[keep], y[keep], rcond=None)
+            res = A @ sol - y
+            mad = 1.4826 * np.median(np.abs(res[:-1] - np.median(res[:-1]))) or 1.0
+            keep = np.r_[np.abs(res[:-1]) <= max(3 * mad, 1.0), True]
+        origin[..., k] = sol.reshape(R, C)
+        resid_all.append(np.abs(res[:-1]))
+    origin -= origin.reshape(-1, 2).min(0)
+    origin = np.rint(origin)
+    resid = np.concatenate(resid_all)
+    return dict(tile_origin=origin.astype(int).tolist(),
+                overlap_y=(h - np.median(np.diff(origin[..., 0], axis=0), axis=1)).tolist(),
+                overlap_x=(w - np.median(np.diff(origin[..., 1], axis=1), axis=0)).tolist(),
+                cross_dy=0.0, cross_dx=0.0, pitch=[float(py), float(px)],
+                residual_px=dict(median=float(np.median(resid)), max=float(resid.max())),
+                seams={k: v.round(2).tolist() for k, v in seams.items()},
+                measured_on="tile array: tiles placed on the chamber lattice (tile_origins_from_lattice)",
+                rotation_deg=0.0)
