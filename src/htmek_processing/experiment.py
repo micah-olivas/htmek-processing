@@ -374,7 +374,7 @@ class Experiment:
                   **{f"{self.assay_dir}/{n}": f"assay {c:g} µM" for n, c in self.assay_runs.items()}}
         return labels.get(key, Path(key).name)
 
-    def check_tiles(self, n_sd=5.0, min_deviation=0.02, stride=8):
+    def check_tiles(self, n_sd=5.0, min_deviation=0.02, stride=8, hot_rows=True, hot_row_threshold=0.02):
         """Every tile's median pixel on every scan (every pass of an assay), against that tile's usual share of the scan
         (its median over the scans of the same kind: the expression and background scans, the SDS washes, the assay
         passes, the standards); a tile
@@ -383,7 +383,10 @@ class Experiment:
         ~0.3% on a good scan). A flagged tile is
         an acquisition problem on that scan (a darker or brighter tile), not chip content. Writes
         4_exports/qc/tile_medians.csv (the analysis notebook flags buttons and chambers in a flagged tile). QC:
-        1_stitch/1b_tile_check."""
+        1_stitch/1b_tile_check.
+
+        With `hot_rows` (default), also the sensor rows off from their neighbors in every raw tile, by more than
+        `hot_row_threshold` (see _check_hot_rows). QC: 1_stitch/1c_hot_rows."""
         from .processing.tiles import tile_deviations, tile_figure, tile_medians
 
         # a scan's medians are reused from the last check while its stitched store is unchanged
@@ -428,13 +431,15 @@ class Experiment:
                   caption="flagged tiles, largest first (rows and columns of the tile grid, from the top left)",
                   fmt={"pass": "{:,.0f}", "deviation (%)": "{:+.1f}"})
         self.save_fig(tile_figure(dev), "1_stitch", "1b_tile_check")
+        if hot_rows:
+            self._check_hot_rows(threshold=hot_row_threshold)
 
     def _camera_of(self, key):
         """A scan's camera: (its key in `cameras`, or "main" for `camera`; that camera's dict)."""
         cam_key = next((v for prefix, v in self.scan_cameras.items() if key.startswith(prefix)), None)
         return (cam_key, self.cameras[cam_key]) if cam_key else ("main", self.camera)
 
-    def check_hot_rows(self, threshold=0.02, frames="ends", stride=4):
+    def _check_hot_rows(self, threshold=0.02, frames="ends", stride=4):
         """Sensor rows whose gain is off from their neighbors', from the raw tiles of every scan (an assay's first and
         last pass, or `frames`): each row's median over the tiles against a running median of the 15 rows around it
         (hp.row_gains). A row off by more than `threshold` (2%; rows agree within ~0.3%) in the median over a camera's

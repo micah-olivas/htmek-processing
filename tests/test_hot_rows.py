@@ -81,3 +81,35 @@ def test_hot_row_mask_follows_the_rotation():
     slope = np.polyfit(xs[first], ys[first], 1)[0]
     assert abs(slope - np.tan(np.deg2rad(2.15))) < 0.01   # a line tilted by the rotation, as in the stitched image
     assert 1 <= m[:95, 35].sum() <= 3                      # 1-3 px thick
+
+
+def test_experiment_step_writes_rows_rois_and_reuses_unchanged_scans(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from htmek_processing.experiment import Experiment
+
+    monkeypatch.chdir(tmp_path)
+    key = "Assays/Standard-MM-series/run_5mM"
+    raw = tmp_path / "drive" / "1_raw-images" / key
+    src = _raw(tmp_path, R=2, C=2, h=200, w=120)
+    raw.parent.mkdir(parents=True)
+    src.parent.rename(raw)                                    # <raw>/tiled_images
+    store = _store(R=2, C=2, h=200, w=120, overlap=(0, 0))
+    centers = tmp_path / "chambers.csv"
+    pd.DataFrame(dict(mark_row=[0, 0], mark_col=[0, 1], x=[60, 180], y=[40, 340])).to_csv(centers, index=False)
+    figs = []
+    exp = SimpleNamespace(exports=tmp_path / "4_exports", raw=tmp_path / "drive" / "1_raw-images", drive=tmp_path / "drive",
+                          scans={key: False}, scan_cameras={}, cameras={}, camera={"name": "Kinetix", "offset": 80.0},
+                          reference_run=key, chamber_centers=centers, chamber_r=10, button_scan=None,
+                          button_centers=tmp_path / "none.csv", button_r=5, stores={key: store},
+                          _is_assay=lambda k: True, _label=lambda k: "assay 5 mM",
+                          save_fig=lambda fig, folder, name: figs.append((folder, name)))
+    exp._camera_of = lambda k: Experiment._camera_of(exp, k)
+    f = Experiment._check_hot_rows(exp)
+    assert f["row"].tolist() == sorted(HOT + DARK) and figs == [("1_stitch", "1c_hot_rows")]
+    rois = pd.read_csv(tmp_path / "4_exports/qc/hot_row_rois.csv")
+    by = rois.set_index("mark_col")["hot_row_px_frac"]
+    assert by[0] > 0 and by[1] == 0                         # y 40 sits on hot row 40; y 340 (tile row 1, row 140) on none
+    first = pd.read_csv(tmp_path / "4_exports/qc/hot_rows.csv")
+    Experiment._check_hot_rows(exp)                          # unchanged raw scan: its gains are reused
+    assert pd.read_csv(tmp_path / "4_exports/qc/hot_rows.csv").equals(first)
