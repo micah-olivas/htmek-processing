@@ -250,7 +250,7 @@ def _left_out(fit):
 
 
 def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), this_good=True):
-    """One rate-vs-[BzP] panel: the variant's other chambers (light blue, each with its MM
+    """One rate-vs-[S] panel: the variant's other chambers (light blue, each with its MM
     curve) and this chamber (dark blue, with its MM curve on top).
 
     A chamber whose MM fit passes the filter (its (mark_row, mark_col) is in `good`; for
@@ -268,10 +268,10 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
     # ---- the variant's other chambers: points, then their MM curves ----
     if reps is not None and len(reps):
         out = np.asarray([rep_left.get((r_, c_)) == b for r_, c_, b in
-                          zip(reps["mark_row"], reps["mark_col"], reps["bzp_uM"])], bool)
+                          zip(reps["mark_row"], reps["mark_col"], reps["s_uM"])], bool)
         out |= _excluded(reps)
         ax.scatter(  # left out of their chamber's fit: x
-            reps.loc[out, "bzp_uM"],
+            reps.loc[out, "s_uM"],
             reps.loc[out, y],
             s=16,
             marker="x",
@@ -285,7 +285,7 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
         ]
         passes = np.asarray(passes, bool)
         ax.scatter(  # passing: filled
-            reps.loc[passes, "bzp_uM"],
+            reps.loc[passes, "s_uM"],
             reps.loc[passes, y],
             s=14,
             c=REPORT_COLORS["replicate"],
@@ -293,7 +293,7 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
             zorder=2,
         )
         ax.scatter(  # failing: open
-            reps.loc[~passes, "bzp_uM"],
+            reps.loc[~passes, "s_uM"],
             reps.loc[~passes, y],
             s=14,
             c="white",
@@ -324,18 +324,18 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
         )
     left = _left_out(this_fit)
     if this is not None and left is not None:  # the point the fit left out, as an x
-        out = this[this["bzp_uM"] == left]
-        ax.plot(out["bzp_uM"], out[y], "x", ms=7, mew=1.6, color=REPORT_COLORS["this"],
+        out = this[this["s_uM"] == left]
+        ax.plot(out["s_uM"], out[y], "x", ms=7, mew=1.6, color=REPORT_COLORS["this"],
                 zorder=4)
-        this = this[this["bzp_uM"] != left]
+        this = this[this["s_uM"] != left]
     if this is not None and _excluded(this).any():  # runs left out of every MM fit
         out = _excluded(this)
-        ax.plot(this.loc[out, "bzp_uM"], this.loc[out, y], "x", ms=7, mew=1.6,
+        ax.plot(this.loc[out, "s_uM"], this.loc[out, y], "x", ms=7, mew=1.6,
                 color=REPORT_COLORS["this"], zorder=4)
         this = this[~out]
     if this is not None:
         ax.plot(
-            this["bzp_uM"],
+            this["s_uM"],
             this[y],
             "o",
             ms=6,
@@ -347,7 +347,7 @@ def _mm_panel(ax, s_max, this, this_fit, reps, rep_fits, y, good=frozenset(), th
         )
     ax.axhline(0, color="0.85", lw=0.6, zorder=0)
     ax.set_xlim(0, s_max * 1.04)
-    ax.set_xlabel("[BzP] (µM)")
+    ax.set_xlabel("[S] (µM)")
 
 
 # chamber report page geometry (inches): one grid of 6 equal columns that every panel snaps
@@ -373,7 +373,7 @@ def _report_page(page, value, norm_col):
       top:    one table, MM fits + chamber details (cols 1-3), a small chip map marking
               this chamber and its variant's other chambers | image crops (cols 4-6)
       middle: progress curve + rate fit per run (cols 1-6), one y-axis
-      bottom: raw rate vs [BzP] (from col 1) and normalized rate (from col 4), square, each
+      bottom: raw rate vs [S] (from col 1) and normalized rate (from col 4), square, each
               with its MM fit, then the key (col 6) and the variant's other replicates overlaid; the key (col 6)
       last:   a thin strip of every chamber's Km (cols 1-4, key in 5-6), with this variant's other
               chambers and this chamber marked (if raw MM fits were given)."""
@@ -387,7 +387,7 @@ def _report_page(page, value, norm_col):
     # rows, as (top, height) in inches from the top of the page
     top_a = 0.9  # table + image crops
     top_b, h_b = top_a + P["col_w"] + 0.85, 1.15  # progress curves, clear of the crops' captions
-    top_c, h_c = top_b + h_b + 0.75, 2.5  # rate-vs-[BzP] panels (square) and key
+    top_c, h_c = top_b + h_b + 0.75, 2.5  # rate-vs-[S] panels (square) and key
     std = page.get("standards")  # this chamber's NADH standards and calibration line, if given
     # with the standard curve as a third square, the key moves to a band under the row
     show_legend = page.get("show_legend", False)  # only on the key page's sample
@@ -459,7 +459,7 @@ def _report_page(page, value, norm_col):
         # top row: one table (cols 1-3), MM fits on the left and chamber details on the
         # right sharing rows; then the image crops (cols 4-6)
         def mm_cell(f, key):
-            """One MM value. A Km beyond the highest [BzP] is shown as "> <highest [BzP]>"
+            """One MM value. A Km beyond the highest [S] is shown as "> <highest [S]>"
             (display only: the fitted value is unchanged in the tables)."""
             if f is None:
                 return np.nan
@@ -633,7 +633,7 @@ def _report_page(page, value, norm_col):
                 ax.sharey(axs[0])
                 ax.tick_params(labelleft=False)
             axs.append(ax)
-            d = g[g["bzp_uM"] == bzp]
+            d = g[g["s_uM"] == bzp]
             ax.plot(
                 d["seconds"],
                 d[value],
@@ -728,7 +728,7 @@ def _report_page(page, value, norm_col):
         axs[0].set_ylim(lo - pad, hi + pad)  # from the data: fit lines end at the edge
         axs[0].set_ylabel(_AXIS_LABELS.get(value, value))
 
-        # bottom row: the two rate-vs-[BzP] panels (square), then the key. Each panel's
+        # bottom row: the two rate-vs-[S] panels (square), then the key. Each panel's
         # y label sits above it (left-aligned) instead of a title, so the normalized panel
         # can sit closer.
         s_max = max(runs)
@@ -1374,8 +1374,8 @@ def _report_key_page(page, value, norm_col):
             "The experiment: its library and start date.")
     add(("box", union(cell_box(0, 0), cell_box(n_rows - 1, 2)), ("bl", "tl"), 0.02),
         "Michaelis–Menten fits",
-        "raw: rate vs [BzP]; per [E]: rate ÷ GFP. K$_m$ “> 5,000” lies beyond the "
-        "highest [BzP], so it is a lower bound; “–”: no K$_m$ (v$_{max}$ ended at 0). fit: the "
+        "raw: rate vs [S]; per [E]: rate ÷ GFP. K$_m$ “> 5,000” lies beyond the "
+        "highest [S], so it is a lower bound; “–”: no K$_m$ (v$_{max}$ ended at 0). fit: the "
         "runs it uses (“w/o” one run: a conditional pass).")
     add(("box", union(cell_box(0, 3), cell_box(n_rows - 3, 4)), ("tc", "tr"), 0.02),
         "Chamber",
@@ -1416,7 +1416,7 @@ def _report_key_page(page, value, norm_col):
     run_axes = list(K["runs"].values())
     add(("box", union(*(union(box_of(ax), box_of(title_of(ax))) for ax in run_axes)),
          ("tl", "bl"), 0), "Progress curves",
-        "NADH per frame, bleach-corrected: one panel per [BzP] run, all on one y axis. "
+        "NADH per frame, bleach-corrected: one panel per [S] run, all on one y axis. "
         "Points are open when the chamber's MM fit fails.")
     line_runs = [b for b, ax in K["runs"].items()
                  if getattr(ax, "key_model", None) == "linear" and b in K["insets"]]
@@ -1431,7 +1431,7 @@ def _report_key_page(page, value, norm_col):
             "Orange: the 4PL fit; thin dark line: its steepest tangent, which is the rate. "
             "A gray line is a straight-line fit.")
     add(("box", union(box_of(K["mm_raw"]), box_of(title_of(K["mm_raw"]))), ("bl", "tl"), 0),
-        "v$_0$ vs [BzP]",
+        "v$_0$ vs [S]",
         "Each run's initial rate v$_0$ (the rate on the traces above) for this chamber and "
         "the variant's other chambers, each with its Michaelis–Menten fit, whose plateau is "
         "v$_{max}$ (BLANKs not shown). ×: a point left out of its chamber's fit.")
@@ -1462,12 +1462,12 @@ def _report_key_page(page, value, norm_col):
             add(("trace", line_path(lines[page["tag"]]), ("below", "br")), "Variant median",
                 "Blue dashed line: median K$_m$ of this variant's chambers that pass.")
         add(("trace", [point(K["km"], km["xmax"], y) for y in (-0.25, 0.25)]), "Off scale",
-            "Triangles at the right edge: K$_m$ above the highest [BzP].")
+            "Triangles at the right edge: K$_m$ above the highest [S].")
     if "vmax_strip" in K:
         add(("box", union(box_of(K["vmax_strip"]), box_of(title_of(K["vmax_strip"]))),
              ("tr", "br"), 0), "v$_{max}$ / [E] of every chamber",
             "The same for v$_{max}$ per [E] (normalized fits, chambers above the [E] floor), on "
-            "a log axis. Where K$_m$ lies beyond the [BzP] range, v$_{max}$ is extrapolated and sits "
+            "a log axis. Where K$_m$ lies beyond the [S] range, v$_{max}$ is extrapolated and sits "
             "off scale at the edge.")
     add(("box", box_of(K["stamp"]), ("tl", "bl"), 0), "Version",
         "Report version and build date.")
@@ -1687,6 +1687,7 @@ def chamber_report_pdf(
     steps=None,
     enzyme_rfu_per_nm=None,
     enzyme_placeholder=False,
+    substrate="bzp_uM",
 ):
     """One PDF page per chamber, for reviewing chambers one by one.
 
@@ -1706,9 +1707,9 @@ def chamber_report_pdf(
         fit in every run), then a full-resolution crop of the chamber in every image of
         `images`, with its ROI circle;
       - middle row: its progress curve in every run of `traces` (x = seconds, y = `value`),
-        with the fit from `rates` (fit_4pl_rates output, keyed by bzp_uM + chamber): 4PL
+        with the fit from `rates` (fit_4pl_rates output, keyed by s_uM + chamber): 4PL
         with its vmax tangent (thin solid line), or the straight line;
-      - bottom row: raw vmax vs [BzP] with its MM fit from `mm_raw`, and the normalized
+      - bottom row: raw vmax vs [S] with its MM fit from `mm_raw`, and the normalized
         rate (`norm_col` of `norm`) with its MM fit from `mm` (fit_mm_table outputs). Both
         overlay the variant's other chambers (light blue). Chambers whose MM fit has
         r² >= `km_min_r2` are drawn filled with solid curves; the rest open with dashed
@@ -1783,7 +1784,12 @@ def chamber_report_pdf(
         )
 
     # one payload per page with only what that page needs: workers never see whole images
-    runs = sorted(traces["bzp_uM"].unique())
+    # the run's [S]: column `substrate` of every table, read below as s_uM (any substrate, e.g. bzp_uM, acp_uM)
+    def _s(t):
+        return t if t is None or "s_uM" in t or substrate not in t else t.assign(s_uM=t[substrate])
+
+    traces, rates, norm = _s(traces), _s(rates), _s(norm)
+    runs = sorted(traces["s_uM"].unique())
     by_chamber = dict(list(traces.groupby(["mark_row", "mark_col"])))
     # chip layout for the small map: every chamber, and each variant's chambers
     chambers_df = traces[["mark_row", "mark_col", "tag"]].drop_duplicates(
@@ -1818,13 +1824,13 @@ def chamber_report_pdf(
     good_raw = passing(mm_raw)
     good_norm = passing(mm)
     # the BLANK chambers' median rate per run: the floor a rate has to clear, on the v0 panel
-    blank_curve = (rates[rates["tag"] == "BLANK"].groupby("bzp_uM")["vmax"].median().sort_index().to_dict()
+    blank_curve = (rates[rates["tag"] == "BLANK"].groupby("s_uM")["vmax"].median().sort_index().to_dict()
                    if "tag" in rates and (rates["tag"] == "BLANK").any() else {})
     # each run's background at its first frame: the BLANKs' median signal (e.g. free phosphate in
     # the mix, turned to NADH by the coupling enzymes before the first image); endpoints are
     # labeled net of it
-    first = traces.groupby("bzp_uM")["frame"].transform("min") == traces["frame"]
-    background0 = (traces[first & (traces["tag"] == "BLANK")].groupby("bzp_uM")[value].median().to_dict()
+    first = traces.groupby("s_uM")["frame"].transform("min") == traces["frame"]
+    background0 = (traces[first & (traces["tag"] == "BLANK")].groupby("s_uM")[value].median().to_dict()
                    if "tag" in traces else {})
     norm_by_tag = dict(list(norm.groupby("tag"))) if norm is not None else {}
     rates_by_tag = dict(list(rates.groupby("tag")))
@@ -1896,7 +1902,7 @@ def chamber_report_pdf(
     v0_data = None
     if "vmax" in rates and mm_raw is not None:
         raw_r2 = mm_raw.set_index(key)["r2"]
-        v0_data = strip_table(rates[rates["bzp_uM"] == max(runs)].rename(columns={"vmax": "v0_top"}),
+        v0_data = strip_table(rates[rates["s_uM"] == max(runs)].rename(columns={"vmax": "v0_top"}),
                               "v0_top", 3,
                               lambda d: d.set_index(key).index.map(raw_r2).to_numpy() >= km_min_r2)
 
@@ -1962,7 +1968,7 @@ def chamber_report_pdf(
                 crops=crops,
                 info=rows,
                 traces=g,
-                fits=fits_by[(r, c)].set_index("bzp_uM")
+                fits=fits_by[(r, c)].set_index("s_uM")
                 if (r, c) in fits_by
                 else pd.DataFrame(),
                 mm=None
@@ -1971,7 +1977,7 @@ def chamber_report_pdf(
                 mm_raw=None
                 if mm_raw_fits is None or (r, c) not in mm_raw_fits.index
                 else mm_raw_fits.loc[(r, c)],
-                norm=nn.sort_values("bzp_uM") if nn is not None else None,
+                norm=nn.sort_values("s_uM") if nn is not None else None,
                 n_replicates=n_rep,
                 rep_raw=rep_raw,
                 rep_raw_fits=others(of_tag(mm_raw, tag), r, c),
@@ -2072,21 +2078,47 @@ def chamber_report_pdf(
     }
     # default: half the cores, so the machine stays usable while it runs
     n_jobs = n_jobs or max(1, (os.cpu_count() or 2) // 2)
+    from ..progress import bar
+
     if n_jobs == 1 or not shutil.which("pdfunite") or len(payloads) < 2 * n_jobs:
-        _report_chunk((payloads, partial, value, norm_col, style, key_payload, lead))
+        with bar(len(payloads), "chamber report", unit="page") as b:
+            # in chunks, so the bar moves; the parts joined as in the parallel case
+            n_ch = max(1, len(payloads) // 20) if shutil.which("pdfunite") else len(payloads)
+            if n_ch == len(payloads) or n_ch == 0:
+                _report_chunk((payloads, partial, value, norm_col, style, key_payload, lead))
+                b.update(len(payloads))
+            else:
+                with tempfile.TemporaryDirectory() as tmp:
+                    bounds = np.linspace(0, len(payloads), 21).round().astype(int)
+                    parts = []
+                    for k in range(20):
+                        part = Path(tmp) / f"part_{k:03d}.pdf"
+                        _report_chunk((payloads[bounds[k]: bounds[k + 1]], part, value, norm_col, style,
+                                       key_payload if k == 19 else None, lead if k == 0 else None))
+                        parts.append(part)
+                        b.update(int(bounds[k + 1] - bounds[k]))
+                    subprocess.run(["pdfunite", *map(str, parts), str(partial)], check=True)
     else:
         with tempfile.TemporaryDirectory() as tmp:
             # contiguous chunks keep chamber order when the parts are joined
-            bounds = np.linspace(0, len(payloads), n_jobs + 1).round().astype(int)
-            parts = [Path(tmp) / f"part_{k:03d}.pdf" for k in range(n_jobs)]
+            # more chunks than workers, so the bar moves as they finish (pages stay in order when joined)
+            n_chunks = min(len(payloads), n_jobs * 8)
+            bounds = np.linspace(0, len(payloads), n_chunks + 1).round().astype(int)
+            parts = [Path(tmp) / f"part_{k:03d}.pdf" for k in range(n_chunks)]
             jobs = [
                 (payloads[bounds[k] : bounds[k + 1]], parts[k], value, norm_col, style,
-                 key_payload if k == n_jobs - 1 else None,  # the key goes last
+                 key_payload if k == n_chunks - 1 else None,  # the key goes last
                  lead if k == 0 else None)  # the flowchart first
-                for k in range(n_jobs)
+                for k in range(n_chunks)
             ]
-            with headless_workers(), ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
-                list(pool.map(_report_chunk, jobs))
+            from concurrent.futures import as_completed
+
+            with bar(len(payloads), "chamber report", unit="page") as b, headless_workers(), \
+                    ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
+                futs = {pool.submit(_report_chunk, j): int(bounds[k + 1] - bounds[k]) for k, j in enumerate(jobs)}
+                for f in as_completed(futs):
+                    f.result()
+                    b.update(futs[f])
             subprocess.run(["pdfunite", *map(str, parts), str(partial)], check=True)
     partial.replace(path)
     n_flow = len({st.get("stage", "rates") for st in flow}) if lead is not None else 0

@@ -77,6 +77,9 @@ class Context:
     n_rows: int
     n_cols: int
     rate_note: str = ""
+    gfp_scan: str = ""  # the GFP scan behind [E] (e.g. "post-binding"), named on the summary page
+    gfp_note: str = ""  # why that scan, printed under the summary table
+    reference_note: str = ""  # why the volcano reference is what it is, when it isn't WT (replaces the default note)
     built: str = field(default_factory=lambda: date.today().isoformat())
     km_label: str = "K$_m$"
     vmax_label: str = "v$_{max}$ / GFP"
@@ -199,13 +202,13 @@ def status_legend(ctx):
 
 # ---- the inputs ---------------------------------------------------------------------------
 def report_tables(gfp, rates, mm_raw, mm_per_gfp, *, floor, gfp_col="button_sum_minus_bg", rate="v0",
-                  min_r2=0.9, rate_unit="µM/s", volcano_kw=None):
+                  min_r2=0.9, rate_unit="µM/s", volcano_kw=None, substrate="bzp_uM"):
     """One row per chamber (tag, GFP, floor verdict, MM fit status, the Km and Vmax / GFP the
     volcano uses, their fit SEs), the rates with rate / GFP, and the volcano tables.
     Returns (chambers, rates, tables {quantity name: table}, quantities, refs)."""
     fits, vrates = V.volcano_inputs(gfp, mm_raw, mm_per_gfp, rates, floor=floor, gfp_col=gfp_col,
-                                    rate=rate, min_r2=min_r2)
-    s_range = (vrates["bzp_uM"].min(), vrates["bzp_uM"].max())
+                                    rate=rate, min_r2=min_r2, s=substrate)
+    s_range = (vrates["s_uM"].min(), vrates["s_uM"].max())
     chambers = gfp[KEYS + ["tag", gfp_col]].rename(columns={gfp_col: "gfp"})
     chambers["E_above_floor"] = chambers["gfp"] > floor
     raw = mm_raw.set_index(KEYS)["r2"]
@@ -317,7 +320,7 @@ def page_chip_maps(pdf, chambers, ctx):
 def page_rate_maps(pdf, chambers, rates, ctx, rate="v0"):
     """Every run over the chip, one run per grid column: the rate, and below it the rate /
     GFP of the chambers above the GFP floor."""
-    runs = np.sort(rates["bzp_uM"].unique())[:6]
+    runs = np.sort(rates["s_uM"].unique())[:6]
     fig = plt.figure(figsize=PAGE)
     page_frame(fig, ctx, "Rate by [S] run")
     side = GRID["col_w"]
@@ -330,7 +333,7 @@ def page_rate_maps(pdf, chambers, rates, ctx, rate="v0"):
         for k, b in enumerate(runs):
             x = grid_col(k)
             d = chambers[KEYS + ["tag"]].merge(
-                rates[rates["bzp_uM"] == b][KEYS + [column, "E_above_floor"]], on=KEYS, how="left")
+                rates[rates["s_uM"] == b][KEYS + [column, "E_above_floor"]], on=KEYS, how="left")
             if column == "rate_per_gfp_count":
                 d.loc[~d["E_above_floor"].fillna(False).astype(bool), column] = np.nan
             v = grid(d, column, ctx) * scale
@@ -546,6 +549,7 @@ def page_summary(pdf, chambers, tables, qs, ctx):
                     else f" ({ctx.reference}{', PLACEHOLDER' if placeholder else ''})")
         rows = [
             ["chambers with DNA", f"{int((chambers['tag'] != 'BLANK').sum()):,}"],
+            *([["GFP for [E]", ctx.gfp_scan]] if ctx.gfp_scan else []),
             ["GFP above the floor", f"{int((~chambers['status'].isin(['BLANK', 'below floor'])).sum()):,}"],
             [f"MM fit r² ≥ {ctx.min_r2:g}", f"{int(analyzed.sum()):,}"],
             ["variants, ≥ 2 analyzed", f"{int((per_variant >= 2).sum())} of {chambers.loc[library, 'tag'].nunique()}"],
@@ -557,8 +561,9 @@ def page_summary(pdf, chambers, tables, qs, ctx):
              f"{int(vm_t['significant'].sum())} of {int(vm_t['tested'].sum())}"],
         ]
         fills = {}
+        ref_row = next(i for i, r in enumerate(rows) if r[0].startswith("reference"))
         if ctx.reference != "WT":  # no WT reference: flag it
-            fills[(5, 1)] = REPORT_COLORS["warn"]
+            fills[(ref_row, 1)] = REPORT_COLORS["warn"]
         row_h = 0.21
         ax = box(fig, grid_col(0), top_a, span(0, 1), row_h * (len(rows) + 1))
         _grid_table(ax, ["summary", ""], rows, label_cols=(0,), col_widths=[0.62, 0.38], fills=fills, size=10.5)
@@ -568,7 +573,14 @@ def page_summary(pdf, chambers, tables, qs, ctx):
         if placeholder:
             note += (f"\nAmber: the {ctx.km_label} reference is a PLACEHOLDER\n({ctx.reference}, not measured on this chip).")
         elif ctx.reference != "WT":
-            note += "\nAmber: too few WT chambers; fold changes\nare vs the library median."
+            note += ("\nAmber: fold changes are vs the library\nmedian (note at the bottom)." if ctx.reference_note
+                     else "\nAmber: too few WT chambers; fold changes\nare vs the library median.")
+        if ctx.gfp_scan:
+            note += f"\n[E]: {ctx.gfp_scan} GFP" + (" (note at the bottom)" if ctx.gfp_note else "")
+        # the full notes: a footer across the page (the bottom row is shortened to make room)
+        footer = [f"[E] from the {ctx.gfp_scan} GFP scan: {ctx.gfp_note}" if ctx.gfp_note else "",
+                  f"Volcano reference: {ctx.reference_note}" if ctx.reference_note and ctx.reference != "WT" else ""]
+        footer = [textwrap.fill(f, 160) for f in footer if f]
         ax.annotate(note, (0, 0), xycoords="axes fraction", xytext=(0, -3), textcoords="offset points",
                     va="top", fontsize=9, color="0.45")
 
@@ -636,7 +648,11 @@ def page_summary(pdf, chambers, tables, qs, ctx):
                          alignment="left")
 
         top_c = top_a + max(table_h + 1.2, map_h + 0.55) + 0.35
-        h_c = 3.2
+        h_c = 3.2 - (0.13 * sum(f.count("\n") + 1 for f in footer) + 0.25 if footer else 0)
+        if footer:
+            W, H = fig.get_size_inches()
+            fig.text(GRID["left"] / W, 0.12 / H, "\n".join(footer), ha="left", va="bottom", fontsize=7.5, color="0.35",
+                     linespacing=1.25)
         ax = box(fig, grid_col(0), top_c, span(0, 1) - 0.2, h_c)
         steps = [("all chambers", len(chambers)),
                  ("DNA printed", int((chambers["tag"] != "BLANK").sum())),
@@ -745,30 +761,34 @@ def page_protocol(pdf, runs, steps, ctx):
 def experiment_report_pdf(path, *, gfp, rates, mm_raw, mm_per_gfp, floor, experiment,
                           rate_unit="µM/s", gfp_col="button_sum_minus_bg", gfp_label="button sum",
                           rate="v0", min_r2=0.9, n_rows=56, n_cols=32, rate_note="", volcano_kw=None,
-                          protocol_log=None):
+                          protocol_log=None, gfp_scan="", gfp_note="", reference_note="", substrate="bzp_uM"):
     """Write the experiment report (5 pages, a 6th with `protocol_log`) to `path`.
 
     gfp        one row per chamber: mark_row, mark_col, tag and `gfp_col` (one GFP scan)
-    rates      one row per chamber and [S] run (bzp_uM), with `rate` (e.g. fit_progress_curves'
+    rates      one row per chamber and [S] run (s_uM, from `substrate`), with `rate` (e.g. fit_progress_curves'
                v0, BLANK-subtracted); runs marked left_out_of_mm are dropped
     mm_raw     raw MM fits per chamber (fit_mm_table: vmax, km, r2, vmax_se, km_se)
     mm_per_gfp per-GFP MM fits per chamber
     floor      the GFP floor (e.g. volcano.gfp_floor(gfp))
     experiment the text at the top right of every page (library · date)
     volcano_kw settings for volcano.variant_table (reference, min_replicates, ...)
+    gfp_scan   the GFP scan behind [E], named on the summary page; gfp_note: why that scan (printed under the table)
+    reference_note  why the volcano reference is not WT (printed under the table instead of the default note)
     protocol_log  a chip-control protocol log (processing.protocol_log.read_protocol_log): adds a page with its
                completed runs as a timeline and a table
     Returns {"km": table, "vmax": table}, the volcano tables behind the summary page."""
     volcano_kw = dict(volcano_kw or {})
-    chambers, vrates, tables, qs, _ = report_tables(gfp, rates, mm_raw, mm_per_gfp, floor=floor,
+    if "s_uM" not in rates:   # the report reads the run's [S] as s_uM
+        rates = rates.assign(s_uM=rates[substrate])
+    chambers, vrates, tables, qs, _ = report_tables(gfp, rates, mm_raw, mm_per_gfp, floor=floor, substrate=substrate,
                                                     gfp_col=gfp_col, rate=rate, min_r2=min_r2,
                                                     rate_unit=rate_unit, volcano_kw=volcano_kw)
-    s_ticks = sorted(float(s) for s in vrates["bzp_uM"].unique())
+    s_ticks = sorted(float(s) for s in vrates["s_uM"].unique())
     ctx = Context(experiment=experiment, rate_unit=rate_unit, gfp_label=gfp_label, floor=floor,
                   s_range=(s_ticks[0], s_ticks[-1]), s_ticks=s_ticks, min_r2=min_r2,
                   p_significant=volcano_kw.get("p_significant", 0.01),
                   reference=tables["km"]["reference"].iloc[0], n_rows=n_rows, n_cols=n_cols,
-                  rate_note=rate_note)
+                  rate_note=rate_note, gfp_scan=gfp_scan, gfp_note=gfp_note, reference_note=reference_note)
     with plt.rc_context({"font.family": "Arial", "font.size": 9, "axes.titlesize": 10,
                          "axes.spines.top": False, "axes.spines.right": False, "pdf.fonttype": 42}):
         with PdfPages(path) as pdf:

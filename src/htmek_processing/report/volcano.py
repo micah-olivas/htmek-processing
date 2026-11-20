@@ -108,8 +108,8 @@ def volcano_inputs(gfp, mm_raw, mm_per_gfp, rates, *, floor, gfp_col="button_sum
         rates = rates[~rates[left_out].fillna(False).astype(bool)]
     rates = rates.merge(e, on=KEYS, how="left")
     rates["rate_per_gfp_count"] = rates[rate] / rates["gfp"]
-    if s != "bzp_uM":  # the functions below read the run's [S] as bzp_uM
-        rates["bzp_uM"] = rates[s]
+    if "s_uM" not in rates:  # the functions below read the run's [S] (column `s`) as s_uM
+        rates["s_uM"] = rates[s]
     return fits, rates
 
 
@@ -145,7 +145,7 @@ def chamber_values(q, fits, rates, s_range, *, require_expressed=True):
     else:
         # when Km is above the highest [S] the fitted Vmax is extrapolated, so the chamber's
         # rate / GFP at the highest [S] (below Vmax at any [S]) is used
-        at_top = rates.loc[rates["bzp_uM"] == s_max, KEYS + ["rate_per_gfp_count"]]
+        at_top = rates.loc[rates["s_uM"] == s_max, KEYS + ["rate_per_gfp_count"]]
         ok = ok.merge(at_top, on=KEYS, how="left")
         beyond = ok["km_uM"].isna() | (ok["km_uM"] > s_max)
         ok["value"] = np.where(beyond, ok["rate_per_gfp_count"], ok["vmax"])
@@ -214,7 +214,7 @@ def variant_table(q, fits, rates, *, reference="WT", exclude=("WT", "BLANK"), mi
     `ref_require_expressed` (default: as `require_expressed`) False lets every reference chamber
     with a passing fit count, its GFP above the floor or not (e.g. a chip where few WT buttons
     clear it); the variants still need it."""
-    s_range = (rates["bzp_uM"].min(), rates["bzp_uM"].max())
+    s_range = (rates["s_uM"].min(), rates["s_uM"].max())
     ok = chamber_values(q, fits, rates, s_range, require_expressed=require_expressed)
     sd, _ = pooled_replicate_sd(ok["log2_value"], ok["tag"])
     ref = ok.loc[ok["tag"] == reference, "log2_value"].to_numpy()

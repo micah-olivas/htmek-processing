@@ -864,7 +864,7 @@ def show_seams(image, seams_y, seams_x, *, title="", half=300):
         for j, x0 in enumerate(seams_x):
             crop = np.asarray(image[y0 - half:y0 + half, x0 - half:x0 + half], dtype=float)
             ax = axes[i, j]
-            ax.imshow(crop, cmap="gray", vmin=np.percentile(crop, 1), vmax=np.percentile(crop, 99.5))
+            ax.imshow(crop, cmap="gray", vmin=np.nanpercentile(crop, 1), vmax=np.nanpercentile(crop, 99.5))
             ax.axhline(half, color="r", lw=0.5, alpha=0.6)
             ax.axvline(half, color="r", lw=0.5, alpha=0.6)
             ax.set_title(f"tiles {i},{j} | {i + 1},{j + 1}", fontsize=8)
@@ -883,6 +883,7 @@ def progress_fit_overlays(traces, rates, value, *, t="seconds", per=("mark_row",
 
     keys = list(per)
     means = traces.groupby(keys)[[t, value]].mean()
+    t0 = traces.groupby(keys)[t].min()
     tt = np.linspace(traces[t].min(), traces[t].max(), n)
     out = dict(curves={}, lines={}, tangents={}, color={})
     for _, f in rates.iterrows():
@@ -892,6 +893,11 @@ def progress_fit_overlays(traces, rates, value, *, t="seconds", per=("mark_row",
             out["curves"][key] = (tt, four_pl(tt, *p))
             out["tangents"][key] = (tt, four_pl(f["t_peak"], *p) + f["v0"] * (tt - f["t_peak"]))
             out["color"][key] = FIT_COLORS["4pl"]
+        elif f["model"] == "4pl_forced" and key in t0.index:   # the 4PL, and v0 as the slope from the run's first point
+            p = (f["a"], f["d"], f["c"], f["b"])
+            out["curves"][key] = (tt, four_pl(tt, *p))
+            out["tangents"][key] = (tt, four_pl(t0[key], *p) + f["v0"] * (tt - t0[key]))
+            out["color"][key] = FIT_COLORS.get("vmax_forced", FIT_COLORS["4pl"])
         elif np.isfinite(f["slope_line"]) and key in means.index:
             tm, ym = means.loc[key]
             out["lines"][key] = (tt, ym + f["slope_line"] * (tt - tm))
@@ -921,6 +927,12 @@ def show_progress_fits(traces, rates, chambers, value, *, t="seconds", labels=No
             ax.plot(tt, four_pl(tt, *p), color=FIT_COLORS["4pl"], lw=2.2, zorder=1)
             ax.plot(tt, four_pl(f["t_peak"], *p) + f["v0"] * (tt - f["t_peak"]),
                     color=FIT_COLORS["vmax"], lw=0.8, zorder=1)
+            ax.set_ylim(*ax.get_ylim())
+        elif f["model"] == "4pl_forced":
+            p = (f["a"], f["d"], f["c"], f["b"])
+            ax.plot(tt, four_pl(tt, *p), color=FIT_COLORS["4pl"], lw=2.2, zorder=1)
+            ax.plot(tt, four_pl(tt[0], *p) + f["v0"] * (tt - tt[0]), color=FIT_COLORS.get("vmax_forced", FIT_COLORS["vmax"]),
+                    lw=0.8, zorder=1)
             ax.set_ylim(*ax.get_ylim())
         else:
             ax.plot(tt, g[value].mean() + f["slope_line"] * (tt - g[t].mean()), color=FIT_COLORS["line"],
