@@ -141,6 +141,7 @@ def fit_mm_table(
     p0=guess_mm,
     bounds=BOUNDS_MM,
     one_out_min_r2=None,
+    progress=None,
 ):
     """One Michaelis-Menten fit per group of `per` (default: per chamber; per=("tag",)
     pools every chamber of a variant). Returns the `per` keys, `keep` columns, and the
@@ -148,8 +149,11 @@ def fit_mm_table(
 
     With `one_out_min_r2`, a fit whose r² falls below it may leave out one [S]
     (fit_mm_one_out), adding the columns r2_all, left_out and r2_status."""
+    from ..progress import track
+
     rows = []
-    for key, g in df.groupby(list(per)):
+    groups = df.groupby(list(per))
+    for key, g in track(groups, progress or "", total=groups.ngroups if progress else 0, unit="chamber"):
         rec = dict(zip(per, key if isinstance(key, tuple) else (key,)))
         rec.update({c: g[c].iloc[0] for c in keep if c in g.columns and c not in per})
         if one_out_min_r2 is None:

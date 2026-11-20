@@ -397,6 +397,7 @@ def fit_4pl_rates(
     plateau_min_frac=None,
     min_points=5,
     n_jobs=None,
+    progress=None,
 ):
     """Per-chamber rate from a 4PL fit of `value` vs `t` (kinetic_traces DataFrame), with
     a straight line as the fallback when the 4PL is fitting noise.
@@ -430,7 +431,7 @@ def fit_4pl_rates(
 
     Chambers are fit in parallel across `n_jobs` processes (default: half the cores; 1 = serial,
     which is also used for small chips, where starting the workers costs more than it
-    saves). Notebooks need nothing extra; a script must call this under
+    saves). `progress` labels a progress bar over the chambers (None: no bar). Notebooks need nothing extra; a script must call this under
     `if __name__ == "__main__":`, since each worker process re-imports the script."""
     import os
     from concurrent.futures import ProcessPoolExecutor
@@ -457,11 +458,20 @@ def fit_4pl_rates(
 
     # default: half the cores, so the machine stays usable while it runs
     n_jobs = n_jobs or max(1, (os.cpu_count() or 2) // 2)
-    if n_jobs == 1 or len(jobs) < 200:
-        fits = [_fit_4pl_summary(j) for j in jobs]
-    else:
-        with headless_workers(), ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
-            fits = list(pool.map(_fit_4pl_summary, jobs, chunksize=32))
+    from ..progress import bar
+
+    with bar(len(jobs) if progress else 0, progress or "", unit="chamber") as b:
+        if n_jobs == 1 or len(jobs) < 200:
+            fits = []
+            for j in jobs:
+                fits.append(_fit_4pl_summary(j))
+                b.update(1)
+        else:
+            with headless_workers(), ProcessPoolExecutor(max_workers=n_jobs) as pool:   # workers draw off screen: no Dock icons
+                fits = []
+                for f in pool.map(_fit_4pl_summary, jobs, chunksize=32):
+                    fits.append(f)
+                    b.update(1)
 
     # fixed column order; columns a chamber's fit didn't produce are NaN
     cols = list(per) + [c for c in keep if c in df.columns]
@@ -619,6 +629,7 @@ def fit_progress_curves(
     p0=guess_4pl,
     bounds=BOUNDS_4PL,
     n_jobs=None,
+    progress=None,
     **rules,
 ):
     """The standard rate step for an assay's progress curves (chamber_timecourse output):
@@ -677,7 +688,7 @@ def fit_progress_curves(
     if substrate is None:   # the [S] rules need the signal in [S]'s units
         kw["max_rise_frac"] = kw["plateau_min_frac"] = None
     rates = fit_4pl_rates(out, value=fitted, t=t, end=end, per=per, p0=p0, bounds=bounds,
-                          substrate=substrate, n_jobs=n_jobs, **kw)
+                          substrate=substrate, n_jobs=n_jobs, progress=progress, **kw)
     s_rules = (f"rise ≤ {kw['max_rise_frac']:g}× [S]; plateau ≥ {kw['plateau_min_frac']:g}× [S]"
                if kw.get("max_rise_frac") is not None else "[S] rules off")
     record_step("fit_progress_curves", "Line and 4PL per run",
