@@ -182,6 +182,8 @@ from .analysis.mm import (  # noqa: F401
 )
 from .analysis.standards import (  # noqa: F401
     calibrate_chambers,
+    fit_pbp_standards,
+    fit_standard_lines,
     predict_conc,
 )
 from .report import (  # noqa: F401
@@ -345,6 +347,8 @@ __all__ = [
     "fit_mm_one_out",
     "fit_mm_table",
     "calibrate_chambers",
+    "fit_pbp_standards",
+    "fit_standard_lines",
     "predict_conc",
     "REPORT_VERSION",
     "REPORT_COLORS",
