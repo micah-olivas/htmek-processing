@@ -374,7 +374,7 @@ class Experiment:
                   **{f"{self.assay_dir}/{n}": f"assay {c:g} µM" for n, c in self.assay_runs.items()}}
         return labels.get(key, Path(key).name)
 
-    def check_tiles(self, n_sd=5.0, min_deviation=0.02, stride=8):
+    def check_tiles(self, n_sd=5.0, min_deviation=0.02, stride=8, hot_rows=True, hot_row_threshold=0.02):
         """Every tile's median pixel on every scan (every pass of an assay), against that tile's usual share of the scan
         (its median over the scans of the same kind: the expression and background scans, the SDS washes, the assay
         passes, the standards); a tile
@@ -383,7 +383,10 @@ class Experiment:
         ~0.3% on a good scan). A flagged tile is
         an acquisition problem on that scan (a darker or brighter tile), not chip content. Writes
         4_exports/qc/tile_medians.csv (the analysis notebook flags buttons and chambers in a flagged tile). QC:
-        1_stitch/1b_tile_check."""
+        1_stitch/1b_tile_check.
+
+        With `hot_rows` (default), also the sensor rows off from their neighbors in every raw tile, by more than
+        `hot_row_threshold` (see _check_hot_rows). QC: 1_stitch/1c_hot_rows."""
         from .processing.tiles import tile_deviations, tile_figure, tile_medians
 
         # a scan's medians are reused from the last check while its stitched store is unchanged
@@ -428,6 +431,104 @@ class Experiment:
                   caption="flagged tiles, largest first (rows and columns of the tile grid, from the top left)",
                   fmt={"pass": "{:,.0f}", "deviation (%)": "{:+.1f}"})
         self.save_fig(tile_figure(dev), "1_stitch", "1b_tile_check")
+        if hot_rows:
+            self._check_hot_rows(threshold=hot_row_threshold)
+
+    def _camera_of(self, key):
+        """A scan's camera: (its key in `cameras`, or "main" for `camera`; that camera's dict)."""
+        cam_key = next((v for prefix, v in self.scan_cameras.items() if key.startswith(prefix)), None)
+        return (cam_key, self.cameras[cam_key]) if cam_key else ("main", self.camera)
+
+    def _check_hot_rows(self, threshold=0.02, frames="ends", stride=4):
+        """Sensor rows whose gain is off from their neighbors', from the raw tiles of every scan (an assay's first and
+        last pass, or `frames`): each row's median over the tiles against a running median of the 15 rows around it
+        (hp.row_gains). A row off by more than `threshold` (2%; rows agree within ~0.3%) in the median over a camera's
+        scans is flagged (hp.hot_rows): a fixed pattern of the camera, in every tile, which stitching turns into a
+        tilted line 2-4 px wide. The flagged rows are mapped through the stitch (rotation, placement) onto the assay
+        chambers and the buttons, to show which ROIs they cross. A QC output only: nothing downstream changes.
+        Writes 4_exports/qc/hot_rows.csv (every scan's row gains), 4_exports/qc/hot_row_rois.csv (each ROI's share
+        of px on a flagged row). QC: 1_stitch/1c_hot_rows."""
+        from .processing.grid import load_centers
+        from .processing.quantify import intensities_at
+        from .processing.stitch import open_tiled
+        from .processing.tiles import hot_row_figure, hot_row_mask, hot_rows, row_gains, row_period
+
+        # a scan's gains are reused from the last check while its raw scan is unchanged
+        old_path = self.exports / "qc/hot_rows.csv"
+        old = pd.read_csv(old_path) if old_path.exists() else None
+        old = old if old is not None and "raw_mtime" in old else None
+        parts, reused, shapes, skipped = [], 0, {}, []
+        for k in self.scans:
+            raw = next((p for p in (self.raw / k, self.drive / k) if p.exists()), None)
+            if raw is None:
+                continue
+            cam_key, cam = self._camera_of(k)
+            meta = next((p for p in (raw / "zarr.json", *raw.glob("*/zarr.json")) if p.exists()), None)
+            mtime = round(meta.stat().st_mtime) if meta else -1
+            try:
+                t = open_tiled(raw)["tile"]
+            except ValueError:   # several channels per tile: not a single-channel scan
+                skipped.append(self._label(k))
+                continue
+            shapes[cam_key] = (t.sizes["y"], t.sizes["x"])
+            prev = old[(old["key"] == k) & (old["raw_mtime"] == mtime)] if old is not None else None
+            if prev is not None and len(prev):
+                parts.append(prev)
+                reused += 1
+                continue
+            offset = cam.get("offset", 0.0)
+            try:
+                g = row_gains(raw, offset=offset if np.isscalar(offset) else 0.0, frames=frames if self._is_assay(k) else "ends",
+                              stride=stride)
+            except ValueError:   # more than one leading dim (e.g. passes and exposures)
+                skipped.append(self._label(k))
+                continue
+            parts.append(g.assign(key=k, scan=self._label(k), camera=cam.get("name", cam_key), raw_mtime=mtime))
+        if not parts:
+            note("**Hot-row check** · no raw scans found")
+            return None
+        gains = pd.concat(parts, ignore_index=True)
+        (self.exports / "qc").mkdir(parents=True, exist_ok=True)
+        gains.to_csv(old_path, index=False)
+        flagged = hot_rows(gains, threshold=threshold)
+        self.hot_rows = flagged
+
+        # which ROIs the flagged rows cross: the chambers on the reference run's stitch, the buttons on the button scan's
+        rois = []
+        for what, key, centers, radius in (("chamber", self.reference_run, self.chamber_centers, self.chamber_r),
+                                            ("button", self.button_scan, self.button_centers, self.button_r)):
+            if not key or not Path(centers).exists():
+                continue
+            cam_key, cam = self._camera_of(key)
+            rows = flagged.loc[flagged["camera"] == cam.get("name", cam_key), "row"]
+            if not len(rows) or cam_key not in shapes:
+                continue
+            if key not in self.stores:
+                self.stitch(key)
+            mask = hot_row_mask(self.stores[key], rows, tile_shape=shapes[cam_key]).astype(np.uint8)
+            cx, cy = load_centers(centers)
+            frac = intensities_at(mask, cx, cy, radius=radius, aggs=("mean",))["mean"]
+            r, c = np.indices(cx.shape)
+            rois.append(pd.DataFrame(dict(roi=what, scan=self._label(key), mark_row=r.ravel(), mark_col=c.ravel(),
+                                          hot_row_px_frac=np.ravel(frac))))
+        rois = pd.concat(rois, ignore_index=True) if rois else pd.DataFrame(columns=["roi", "scan", "mark_row", "mark_col", "hot_row_px_frac"])
+        rois.to_csv(self.exports / "qc/hot_row_rois.csv", index=False)
+
+        lines = []
+        for cam, f in flagged.groupby("camera", sort=False):
+            per = row_period(f["row"], f["gain"])
+            worst = f.loc[(f["gain"] - 1).abs().idxmax()]
+            lines.append(f"{cam}: {len(f)} rows" + (f" (every {per})" if per else "")
+                         + f", worst row {int(worst['row'])} at {worst['gain']:.2f}x ({worst['gain_lo']:.2f}-{worst['gain_hi']:.2f}x over scans and passes)")
+        crossed = ", ".join(f"{(g['hot_row_px_frac'] > 0).sum():,} of {len(g):,} {w}s (median {100 * g['hot_row_px_frac'].median():.1f}% of the ROI)"
+                            for w, g in rois.groupby("roi", sort=False))
+        note(f"**Hot-row check** · {gains['key'].nunique()} scans ({len(parts) - reused} read, {reused} unchanged since the last check) · "
+             f"rows off by > {100 * threshold:g}% from their neighbors: " + ("; ".join(lines) if lines else "none")
+             + (f" · on a flagged row: {crossed}" if crossed else "")
+             + (f" · not checked (several channels or leading dims): {', '.join(skipped)}" if skipped else "")
+             + " · `4_exports/qc/hot_rows.csv`, `4_exports/qc/hot_row_rois.csv`")
+        self.save_fig(hot_row_figure(gains, flagged, threshold=threshold), "1_stitch", "1c_hot_rows")
+        return flagged
 
     # ------------------------------------------------------------------ 2. expression time course
     def place_dumbbells(self, force=None):
